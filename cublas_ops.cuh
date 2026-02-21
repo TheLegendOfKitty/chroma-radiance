@@ -1,6 +1,7 @@
 #pragma once
 #include "tensor.cuh"
 #include <cublas_v2.h>
+#include <cublasLt.h>
 
 #define CHECK_CUBLAS(call) do { \
     cublasStatus_t err = (call); \
@@ -11,17 +12,75 @@
 } while(0)
 
 static cublasHandle_t g_cublas = nullptr;
+static cublasLtHandle_t g_cublaslt = nullptr;
 
 static void init_cublas() {
     if (!g_cublas) CHECK_CUBLAS(cublasCreate(&g_cublas));
     CHECK_CUBLAS(cublasSetMathMode(g_cublas, CUBLAS_DEFAULT_MATH));
+    if (!g_cublaslt) CHECK_CUBLAS(cublasLtCreate(&g_cublaslt));
+}
+
+// cublasLt linear with fused bias epilogue
+// Row-major: output = x @ W^T + bias
+// x: [M, K], W: [N, K], bias: [N] or null, output: [M, N]
+// All with F32 accumulation. Bias is fused into the GEMM epilogue (zero extra cost).
+static void linear_lt(int64_t M, int64_t K, int64_t N,
+                       const void* x_data, cudaDataType_t x_type,
+                       const void* w_data, cudaDataType_t w_type,
+                       const void* bias_data,
+                       void* out_data) {
+    float alpha = 1.0f, beta = 0.0f;
+
+    cublasLtMatmulDesc_t matmul_desc;
+    CHECK_CUBLAS(cublasLtMatmulDescCreate(&matmul_desc, CUBLAS_COMPUTE_32F, CUDA_R_32F));
+
+    // Set transpose ops for row-major: C = x @ W^T
+    // cuBLAS col-major: C'^[N,M] = W[N,K] @ x'^[K,M]
+    cublasOperation_t transa = CUBLAS_OP_T;
+    cublasOperation_t transb = CUBLAS_OP_N;
+    CHECK_CUBLAS(cublasLtMatmulDescSetAttribute(matmul_desc, CUBLASLT_MATMUL_DESC_TRANSA, &transa, sizeof(transa)));
+    CHECK_CUBLAS(cublasLtMatmulDescSetAttribute(matmul_desc, CUBLASLT_MATMUL_DESC_TRANSB, &transb, sizeof(transb)));
+
+    // Set bias epilogue if bias is provided
+    if (bias_data) {
+        cublasLtEpilogue_t epilogue = CUBLASLT_EPILOGUE_BIAS;
+        CHECK_CUBLAS(cublasLtMatmulDescSetAttribute(matmul_desc, CUBLASLT_MATMUL_DESC_EPILOGUE, &epilogue, sizeof(epilogue)));
+        CHECK_CUBLAS(cublasLtMatmulDescSetAttribute(matmul_desc, CUBLASLT_MATMUL_DESC_BIAS_POINTER, &bias_data, sizeof(bias_data)));
+        cudaDataType_t bias_type = CUDA_R_32F;
+        CHECK_CUBLAS(cublasLtMatmulDescSetAttribute(matmul_desc, CUBLASLT_MATMUL_DESC_BIAS_DATA_TYPE, &bias_type, sizeof(bias_type)));
+    }
+
+    // Matrix layouts (column-major perspective)
+    // A = W row-major [N,K] → col-major [K,N], ld=K (transposed to [N,K])
+    // B = x row-major [M,K] → col-major [K,M], ld=K
+    // C = output row-major [M,N] → col-major [N,M], ld=N
+    cublasLtMatrixLayout_t layout_a, layout_b, layout_c;
+    CHECK_CUBLAS(cublasLtMatrixLayoutCreate(&layout_a, w_type, K, N, K));
+    CHECK_CUBLAS(cublasLtMatrixLayoutCreate(&layout_b, x_type, K, M, K));
+    CHECK_CUBLAS(cublasLtMatrixLayoutCreate(&layout_c, CUDA_R_32F, N, M, N));
+
+    CHECK_CUBLAS(cublasLtMatmul(g_cublaslt,
+        matmul_desc,
+        &alpha,
+        w_data, layout_a,     // A = W
+        x_data, layout_b,     // B = x
+        &beta,
+        out_data, layout_c,   // C = output
+        out_data, layout_c,   // D = output (in-place)
+        nullptr,              // algo (nullptr = heuristic)
+        nullptr, 0,           // workspace
+        0));                  // stream
+
+    cublasLtMatrixLayoutDestroy(layout_a);
+    cublasLtMatrixLayoutDestroy(layout_b);
+    cublasLtMatrixLayoutDestroy(layout_c);
+    cublasLtMatmulDescDestroy(matmul_desc);
 }
 
 // Linear: output = x @ W^T + bias
 // x: [M, K], W: [N, K], bias: [N] or null, output: [M, N]
 // All stored row-major. Uses F32 accumulation.
-// Post-GEMM bias: GEMM with beta=0, then add bias. Enables cuBLAS fast paths
-// and eliminates the broadcast_bias kernel launch.
+// Bias is fused into the GEMM epilogue via cublasLt (zero extra kernel launches).
 static void linear(const Tensor& x, const Tensor& W, const Tensor* bias, Tensor& output) {
     assert(x.on_gpu && W.on_gpu && output.on_gpu);
     assert(x.ndim >= 1 && W.ndim == 2);
@@ -32,82 +91,27 @@ static void linear(const Tensor& x, const Tensor& W, const Tensor* bias, Tensor&
     assert(W.shape[1] == K);
     assert(output.numel() == M * N);
 
-    float alpha = 1.0f, beta = 0.0f;
+    const void* bias_data = (bias && bias->on_gpu && bias->dtype == DType::F32) ? bias->data : nullptr;
 
     if (x.dtype == DType::F32 && W.dtype == DType::F32) {
-        // F32 GEMM: output = x @ W^T
-        // cuBLAS column-major: C^T = W @ x^T
-        // op(A) = W [N,K], op(B) = x^T [K,M], C = output^T [N,M]
-        CHECK_CUBLAS(cublasGemmEx(g_cublas,
-            CUBLAS_OP_T, CUBLAS_OP_N,
-            N, M, K,
-            &alpha,
-            W.data, CUDA_R_32F, K,    // W row-major [N,K], transposed
-            x.data, CUDA_R_32F, K,    // x row-major [M,K]
-            &beta,
-            output.data, CUDA_R_32F, N,
-            CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
+        linear_lt(M, K, N, x.data, CUDA_R_32F, W.data, CUDA_R_32F, bias_data, output.data);
     } else if (x.dtype == DType::BF16 && W.dtype == DType::BF16) {
-        // BF16 GEMM with F32 accumulation
-        CHECK_CUBLAS(cublasGemmEx(g_cublas,
-            CUBLAS_OP_T, CUBLAS_OP_N,
-            N, M, K,
-            &alpha,
-            W.data, CUDA_R_16BF, K,
-            x.data, CUDA_R_16BF, K,
-            &beta,
-            output.data, CUDA_R_32F, N,
-            CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
+        linear_lt(M, K, N, x.data, CUDA_R_16BF, W.data, CUDA_R_16BF, bias_data, output.data);
     } else if (x.dtype == DType::FP16 && W.dtype == DType::FP16) {
-        // FP16 GEMM with F32 accumulation
-        CHECK_CUBLAS(cublasGemmEx(g_cublas,
-            CUBLAS_OP_T, CUBLAS_OP_N,
-            N, M, K,
-            &alpha,
-            W.data, CUDA_R_16F, K,
-            x.data, CUDA_R_16F, K,
-            &beta,
-            output.data, CUDA_R_32F, N,
-            CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
+        linear_lt(M, K, N, x.data, CUDA_R_16F, W.data, CUDA_R_16F, bias_data, output.data);
     } else if (x.dtype == DType::F32 && W.dtype == DType::BF16) {
-        // Mixed: F32 input, BF16 weight — convert x (smaller) to BF16 and use BF16 GEMM
-        // BF16 tensor cores are 2x faster; accumulation stays in F32 via CUBLAS_COMPUTE_32F
+        // Mixed: F32 input, BF16 weight — convert x to BF16 and use BF16 GEMM
         Tensor x_bf16 = Tensor::alloc_shape(x.ndim, x.shape, DType::BF16, true);
         f32_to_bf16_cuda(x.f32(), x_bf16.bf16(), x.numel());
-        CHECK_CUBLAS(cublasGemmEx(g_cublas,
-            CUBLAS_OP_T, CUBLAS_OP_N,
-            N, M, K,
-            &alpha,
-            W.data, CUDA_R_16BF, K,
-            x_bf16.data, CUDA_R_16BF, K,
-            &beta,
-            output.data, CUDA_R_32F, N,
-            CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
+        linear_lt(M, K, N, x_bf16.data, CUDA_R_16BF, W.data, CUDA_R_16BF, bias_data, output.data);
     } else if (x.dtype == DType::F32 && W.dtype == DType::FP16) {
-        // Mixed: F32 input, FP16 weight — convert x (smaller) to FP16 and use FP16 GEMM
+        // Mixed: F32 input, FP16 weight — convert x to FP16 and use FP16 GEMM
         Tensor x_fp16 = Tensor::alloc_shape(x.ndim, x.shape, DType::FP16, true);
         f32_to_fp16_cuda(x.f32(), x_fp16.fp16(), x.numel());
-        CHECK_CUBLAS(cublasGemmEx(g_cublas,
-            CUBLAS_OP_T, CUBLAS_OP_N,
-            N, M, K,
-            &alpha,
-            W.data, CUDA_R_16F, K,
-            x_fp16.data, CUDA_R_16F, K,
-            &beta,
-            output.data, CUDA_R_32F, N,
-            CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
+        linear_lt(M, K, N, x_fp16.data, CUDA_R_16F, W.data, CUDA_R_16F, bias_data, output.data);
     } else {
         fprintf(stderr, "Unsupported dtype combo in linear: x=%s W=%s\n", dtype_name(x.dtype), dtype_name(W.dtype));
         exit(1);
-    }
-
-    // Post-GEMM bias add (data is warm in cache from GEMM write)
-    if (bias) {
-        assert(bias->on_gpu);
-        extern void add_bias_cuda(float* data, const float* bias, int64_t M, int64_t N);
-        if (bias->dtype == DType::F32 && output.dtype == DType::F32) {
-            add_bias_cuda(output.f32(), bias->f32(), M, N);
-        }
     }
 }
 
@@ -123,9 +127,6 @@ static void matmul(const Tensor& A, const Tensor& B, Tensor& C) {
 
     float alpha = 1.0f, beta = 0.0f;
 
-    // cuBLAS column-major: C^T = B^T @ A^T
-    // B row-major [K,N] → cuBLAS sees [N,K] = B^T already
-    // A row-major [M,K] → cuBLAS sees [K,M] = A^T already
     CHECK_CUBLAS(cublasGemmEx(g_cublas,
         CUBLAS_OP_N, CUBLAS_OP_N,
         N, M, K,
@@ -170,7 +171,6 @@ static void batched_matmul(const Tensor& A, const Tensor& B, Tensor& C) {
 
 // Batched matmul with B transposed: C[b] = A[b] @ B[b]^T
 // A: [batch, M, K], B: [batch, N, K], C: [batch, M, N], all F32
-// Note: B shape is [batch, N, K] (rows=N, cols=K), transposed to [K, N] for matmul
 static void batched_matmul_Bt(const Tensor& A, const Tensor& B, Tensor& C) {
     assert(A.on_gpu && B.on_gpu && C.on_gpu);
     assert(A.dtype == DType::F32 && B.dtype == DType::F32 && C.dtype == DType::F32);
@@ -188,18 +188,14 @@ static void batched_matmul_Bt(const Tensor& A, const Tensor& B, Tensor& C) {
     int64_t strideB = N * K;
     int64_t strideC = M * N;
 
-    // Row-major C = A @ B^T → cuBLAS col-major: C' = B @ A^T
-    // B row-major [N,K] → cuBLAS sees [K,N] → with CUBLAS_OP_T: [N,K]^T = [K,N]...
-    // Actually: C = A @ B^T in row-major
-    // cuBLAS: C'^[N,M] = (B')^T[N,K] @ A'[K,M] where ' denotes col-major interpretation
     CHECK_CUBLAS(cublasGemmStridedBatchedEx(g_cublas,
         CUBLAS_OP_T, CUBLAS_OP_N,
         N, M, K,
         &alpha,
-        B.data, CUDA_R_32F, K, strideB,   // B row-major [N,K] → col-major [K,N], ld=K
-        A.data, CUDA_R_32F, K, strideA,   // A row-major [M,K] → col-major [K,M], ld=K
+        B.data, CUDA_R_32F, K, strideB,
+        A.data, CUDA_R_32F, K, strideA,
         &beta,
-        C.data, CUDA_R_32F, N, strideC,   // C row-major [M,N] → col-major [N,M], ld=N
+        C.data, CUDA_R_32F, N, strideC,
         batch,
         CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
 }

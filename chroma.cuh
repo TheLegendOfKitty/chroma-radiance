@@ -449,12 +449,25 @@ struct ChromaRadiance {
         float* txt_scale2 = get_mod(txt_off + 4);
         float* txt_gate2  = get_mod(txt_off + 5);
 
+        // === Pre-allocate joint Q/K/V buffers (eliminates concat_first_dim) ===
+        Tensor all_q = Tensor::alloc({total_tokens, (int64_t)hidden_size}, DType::F32, true);
+        Tensor all_k = Tensor::alloc({total_tokens, (int64_t)hidden_size}, DType::F32, true);
+        Tensor all_v = Tensor::alloc({total_tokens, (int64_t)hidden_size}, DType::F32, true);
+
+        // Create views into the joint buffers for txt [0..txt_tokens) and img [txt_tokens..total)
+        Tensor txt_q_view = Tensor::wrap_gpu(all_q.f32(), {txt_tokens, (int64_t)hidden_size}, DType::F32);
+        Tensor txt_k_view = Tensor::wrap_gpu(all_k.f32(), {txt_tokens, (int64_t)hidden_size}, DType::F32);
+        Tensor txt_v_view = Tensor::wrap_gpu(all_v.f32(), {txt_tokens, (int64_t)hidden_size}, DType::F32);
+        Tensor img_q_view = Tensor::wrap_gpu(all_q.f32() + txt_tokens * hidden_size, {img_tokens, (int64_t)hidden_size}, DType::F32);
+        Tensor img_k_view = Tensor::wrap_gpu(all_k.f32() + txt_tokens * hidden_size, {img_tokens, (int64_t)hidden_size}, DType::F32);
+        Tensor img_v_view = Tensor::wrap_gpu(all_v.f32() + txt_tokens * hidden_size, {img_tokens, (int64_t)hidden_size}, DType::F32);
+
         // === Image attention ===
         Tensor img_mod = Tensor::alloc({img_tokens, (int64_t)hidden_size}, DType::F32, true);
         modulate_cuda(img.f32(), img_shift1, img_scale1, img_mod.f32(),
                       img_tokens, hidden_size, 1e-6f);
 
-        // Separate Q/K/V projections using weight views (eliminates slice_columns)
+        // Convert img_mod to BF16 once for all 3 QKV projections (shared BF16 conversion)
         size_t qkv_row_bytes = (int64_t)hidden_size * dtype_size(w.img_qkv_w.dtype);
         Tensor iq_w = Tensor::wrap_gpu(w.img_qkv_w.data, {(int64_t)hidden_size, (int64_t)hidden_size}, w.img_qkv_w.dtype);
         Tensor ik_w = Tensor::wrap_gpu((char*)w.img_qkv_w.data + qkv_row_bytes * hidden_size, {(int64_t)hidden_size, (int64_t)hidden_size}, w.img_qkv_w.dtype);
@@ -463,19 +476,24 @@ struct ChromaRadiance {
         Tensor ik_b = Tensor::wrap_gpu(w.img_qkv_b.f32() + hidden_size, {(int64_t)hidden_size}, DType::F32);
         Tensor iv_b = Tensor::wrap_gpu(w.img_qkv_b.f32() + 2 * hidden_size, {(int64_t)hidden_size}, DType::F32);
 
-        Tensor img_q = linear_forward(img_mod, iq_w, &iq_b);
-        Tensor img_k = linear_forward(img_mod, ik_w, &ik_b);
-        Tensor img_v = linear_forward(img_mod, iv_w, &iv_b);
+        // Shared BF16 conversion: convert once, reuse for Q/K/V
+        Tensor img_mod_bf16 = Tensor::alloc({img_tokens, (int64_t)hidden_size}, DType::BF16, true);
+        f32_to_bf16_cuda(img_mod.f32(), img_mod_bf16.bf16(), img_mod.numel());
 
-        qk_norm(img_q.f32(), w.img_q_norm.f32(), img_tokens, num_heads, d_head);
-        qk_norm(img_k.f32(), w.img_k_norm.f32(), img_tokens, num_heads, d_head);
+        // Write directly into joint buffer views (eliminates concat)
+        linear(img_mod_bf16, iq_w, &iq_b, img_q_view);
+        linear(img_mod_bf16, ik_w, &ik_b, img_k_view);
+        linear(img_mod_bf16, iv_w, &iv_b, img_v_view);
+
+        qk_norm(img_q_view.f32(), w.img_q_norm.f32(), img_tokens, num_heads, d_head);
+        qk_norm(img_k_view.f32(), w.img_k_norm.f32(), img_tokens, num_heads, d_head);
 
         // === Text attention ===
         Tensor txt_mod_t = Tensor::alloc({txt_tokens, (int64_t)hidden_size}, DType::F32, true);
         modulate_cuda(txt.f32(), txt_shift1, txt_scale1, txt_mod_t.f32(),
                       txt_tokens, hidden_size, 1e-6f);
 
-        // Separate Q/K/V projections using weight views
+        // Shared BF16 conversion for txt
         Tensor tq_w = Tensor::wrap_gpu(w.txt_qkv_w.data, {(int64_t)hidden_size, (int64_t)hidden_size}, w.txt_qkv_w.dtype);
         Tensor tk_w = Tensor::wrap_gpu((char*)w.txt_qkv_w.data + qkv_row_bytes * hidden_size, {(int64_t)hidden_size, (int64_t)hidden_size}, w.txt_qkv_w.dtype);
         Tensor tv_w = Tensor::wrap_gpu((char*)w.txt_qkv_w.data + qkv_row_bytes * 2 * hidden_size, {(int64_t)hidden_size, (int64_t)hidden_size}, w.txt_qkv_w.dtype);
@@ -483,23 +501,16 @@ struct ChromaRadiance {
         Tensor tk_b = Tensor::wrap_gpu(w.txt_qkv_b.f32() + hidden_size, {(int64_t)hidden_size}, DType::F32);
         Tensor tv_b = Tensor::wrap_gpu(w.txt_qkv_b.f32() + 2 * hidden_size, {(int64_t)hidden_size}, DType::F32);
 
-        Tensor txt_q = linear_forward(txt_mod_t, tq_w, &tq_b);
-        Tensor txt_k = linear_forward(txt_mod_t, tk_w, &tk_b);
-        Tensor txt_v = linear_forward(txt_mod_t, tv_w, &tv_b);
+        Tensor txt_mod_bf16 = Tensor::alloc({txt_tokens, (int64_t)hidden_size}, DType::BF16, true);
+        f32_to_bf16_cuda(txt_mod_t.f32(), txt_mod_bf16.bf16(), txt_mod_t.numel());
 
-        qk_norm(txt_q.f32(), w.txt_q_norm.f32(), txt_tokens, num_heads, d_head);
-        qk_norm(txt_k.f32(), w.txt_k_norm.f32(), txt_tokens, num_heads, d_head);
+        // Write directly into joint buffer views
+        linear(txt_mod_bf16, tq_w, &tq_b, txt_q_view);
+        linear(txt_mod_bf16, tk_w, &tk_b, txt_k_view);
+        linear(txt_mod_bf16, tv_w, &tv_b, txt_v_view);
 
-        // === Joint attention ===
-        Tensor all_q = Tensor::alloc({total_tokens, (int64_t)hidden_size}, DType::F32, true);
-        Tensor all_k = Tensor::alloc({total_tokens, (int64_t)hidden_size}, DType::F32, true);
-        Tensor all_v = Tensor::alloc({total_tokens, (int64_t)hidden_size}, DType::F32, true);
-        concat_first_dim_cuda(txt_q.f32(), img_q.f32(), all_q.f32(),
-                              txt_tokens, img_tokens, hidden_size);
-        concat_first_dim_cuda(txt_k.f32(), img_k.f32(), all_k.f32(),
-                              txt_tokens, img_tokens, hidden_size);
-        concat_first_dim_cuda(txt_v.f32(), img_v.f32(), all_v.f32(),
-                              txt_tokens, img_tokens, hidden_size);
+        qk_norm(txt_q_view.f32(), w.txt_q_norm.f32(), txt_tokens, num_heads, d_head);
+        qk_norm(txt_k_view.f32(), w.txt_k_norm.f32(), txt_tokens, num_heads, d_head);
 
         Tensor q_r = all_q.reshape({total_tokens, (int64_t)num_heads, (int64_t)d_head});
         Tensor k_r = all_k.reshape({total_tokens, (int64_t)num_heads, (int64_t)d_head});
@@ -583,10 +594,18 @@ struct ChromaRadiance {
         Tensor sv_b = Tensor::wrap_gpu(w.linear1_b.f32() + 2 * hidden_size, {(int64_t)hidden_size}, DType::F32);
         Tensor sm_b = Tensor::wrap_gpu(w.linear1_b.f32() + 3 * hidden_size, {(int64_t)mlp_hidden}, DType::F32);
 
-        Tensor q_t = linear_forward(x_mod, sq_w, &sq_b);
-        Tensor k_t = linear_forward(x_mod, sk_w, &sk_b);
-        Tensor v_t = linear_forward(x_mod, sv_w, &sv_b);
-        Tensor mlp_t = linear_forward(x_mod, sm_w, &sm_b);
+        // Shared BF16 conversion: convert x_mod once, reuse for all 4 projections
+        Tensor x_mod_bf16 = Tensor::alloc({L, (int64_t)hidden_size}, DType::BF16, true);
+        f32_to_bf16_cuda(x_mod.f32(), x_mod_bf16.bf16(), x_mod.numel());
+
+        Tensor q_t = Tensor::alloc({L, (int64_t)hidden_size}, DType::F32, true);
+        Tensor k_t = Tensor::alloc({L, (int64_t)hidden_size}, DType::F32, true);
+        Tensor v_t = Tensor::alloc({L, (int64_t)hidden_size}, DType::F32, true);
+        Tensor mlp_t = Tensor::alloc({L, (int64_t)mlp_hidden}, DType::F32, true);
+        linear(x_mod_bf16, sq_w, &sq_b, q_t);
+        linear(x_mod_bf16, sk_w, &sk_b, k_t);
+        linear(x_mod_bf16, sv_w, &sv_b, v_t);
+        linear(x_mod_bf16, sm_w, &sm_b, mlp_t);
 
         // QKNorm
         qk_norm(q_t.f32(), w.q_norm.f32(), L, num_heads, d_head);

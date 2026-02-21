@@ -16,7 +16,7 @@ target_include_directories(chroma-radiance PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 
 # cuBLAS
 find_package(CUDAToolkit REQUIRED)
-target_link_libraries(chroma-radiance PRIVATE CUDA::cublas CUDA::cudart)
+target_link_libraries(chroma-radiance PRIVATE CUDA::cublas CUDA::cublasLt CUDA::cudart)
 
 # Optimization flags
 target_compile_options(chroma-radiance PRIVATE

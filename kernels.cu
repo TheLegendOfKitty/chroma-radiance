@@ -186,18 +186,32 @@ void rms_norm_cuda(const float* x, const float* scale, float* out, int64_t rows,
 // Used by Chroma transformer
 // ============================================================================
 
+__device__ __forceinline__ float gelu_val(float v) {
+    float inner = 0.7978845608f * (v + 0.044715f * v * v * v);
+    return 0.5f * v * (1.0f + tanhf(inner));
+}
+
 __global__ void gelu_kernel(const float* x, float* out, int64_t n) {
-    int64_t i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) {
-        float v = x[i];
-        float inner = 0.7978845608f * (v + 0.044715f * v * v * v);
-        out[i] = 0.5f * v * (1.0f + tanhf(inner));
+    int64_t i = ((int64_t)blockIdx.x * blockDim.x + threadIdx.x) * 4;
+    if (i + 3 < n) {
+        float4 v = *reinterpret_cast<const float4*>(x + i);
+        float4 r;
+        r.x = gelu_val(v.x);
+        r.y = gelu_val(v.y);
+        r.z = gelu_val(v.z);
+        r.w = gelu_val(v.w);
+        *reinterpret_cast<float4*>(out + i) = r;
+    } else {
+        for (int64_t j = i; j < n && j < i + 4; j++) {
+            out[j] = gelu_val(x[j]);
+        }
     }
 }
 
 void gelu_cuda(const float* x, float* out, int64_t n) {
     int threads = 256;
-    int blocks = (n + threads - 1) / threads;
+    int64_t work = (n + 3) / 4;
+    int blocks = (work + threads - 1) / threads;
     gelu_kernel<<<blocks, threads>>>(x, out, n);
 }
 
@@ -224,17 +238,25 @@ void gelu_exact_cuda(const float* x, float* out, int64_t n) {
 // SiLU: x * sigmoid(x)
 // ============================================================================
 
+__device__ __forceinline__ float silu_val(float v) {
+    return v / (1.0f + expf(-v));
+}
+
 __global__ void silu_kernel(const float* x, float* out, int64_t n) {
-    int64_t i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) {
-        float v = x[i];
-        out[i] = v / (1.0f + expf(-v));
+    int64_t i = ((int64_t)blockIdx.x * blockDim.x + threadIdx.x) * 4;
+    if (i + 3 < n) {
+        float4 v = *reinterpret_cast<const float4*>(x + i);
+        float4 r = {silu_val(v.x), silu_val(v.y), silu_val(v.z), silu_val(v.w)};
+        *reinterpret_cast<float4*>(out + i) = r;
+    } else {
+        for (int64_t j = i; j < n && j < i + 4; j++) out[j] = silu_val(x[j]);
     }
 }
 
 void silu_cuda(const float* x, float* out, int64_t n) {
     int threads = 256;
-    int blocks = (n + threads - 1) / threads;
+    int64_t work = (n + 3) / 4;
+    int blocks = (work + threads - 1) / threads;
     silu_kernel<<<blocks, threads>>>(x, out, n);
 }
 
@@ -243,24 +265,40 @@ void silu_cuda(const float* x, float* out, int64_t n) {
 // ============================================================================
 
 __global__ void add_kernel(const float* a, const float* b, float* out, int64_t n) {
-    int64_t i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) out[i] = a[i] + b[i];
+    int64_t i = ((int64_t)blockIdx.x * blockDim.x + threadIdx.x) * 4;
+    if (i + 3 < n) {
+        float4 va = *reinterpret_cast<const float4*>(a + i);
+        float4 vb = *reinterpret_cast<const float4*>(b + i);
+        float4 r = {va.x + vb.x, va.y + vb.y, va.z + vb.z, va.w + vb.w};
+        *reinterpret_cast<float4*>(out + i) = r;
+    } else {
+        for (int64_t j = i; j < n && j < i + 4; j++) out[j] = a[j] + b[j];
+    }
 }
 
 void add_cuda(const float* a, const float* b, float* out, int64_t n) {
     int threads = 256;
-    int blocks = (n + threads - 1) / threads;
+    int64_t work = (n + 3) / 4;
+    int blocks = (work + threads - 1) / threads;
     add_kernel<<<blocks, threads>>>(a, b, out, n);
 }
 
 __global__ void mul_kernel(const float* a, const float* b, float* out, int64_t n) {
-    int64_t i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) out[i] = a[i] * b[i];
+    int64_t i = ((int64_t)blockIdx.x * blockDim.x + threadIdx.x) * 4;
+    if (i + 3 < n) {
+        float4 va = *reinterpret_cast<const float4*>(a + i);
+        float4 vb = *reinterpret_cast<const float4*>(b + i);
+        float4 r = {va.x * vb.x, va.y * vb.y, va.z * vb.z, va.w * vb.w};
+        *reinterpret_cast<float4*>(out + i) = r;
+    } else {
+        for (int64_t j = i; j < n && j < i + 4; j++) out[j] = a[j] * b[j];
+    }
 }
 
 void mul_cuda(const float* a, const float* b, float* out, int64_t n) {
     int threads = 256;
-    int blocks = (n + threads - 1) / threads;
+    int64_t work = (n + 3) / 4;
+    int blocks = (work + threads - 1) / threads;
     mul_kernel<<<blocks, threads>>>(a, b, out, n);
 }
 
@@ -511,43 +549,60 @@ void conv2d_3x3_cuda(const float* input, const float* weight, const float* bias,
 // Transpose: [rows, cols] -> [cols, rows]
 // ============================================================================
 
-__global__ void transpose_2d_kernel(const float* input, float* output, int64_t rows, int64_t cols) {
-    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= rows * cols) return;
-    int64_t r = idx / cols;
-    int64_t c = idx % cols;
-    output[c * rows + r] = input[r * cols + c];
-}
+// Forward declaration
+void batched_transpose_2d_cuda(const float* input, float* output,
+                                int64_t batch, int64_t rows, int64_t cols);
 
 void transpose_2d_cuda(const float* input, float* output, int64_t rows, int64_t cols) {
-    int64_t total = rows * cols;
-    int threads = 256;
-    int blocks = (total + threads - 1) / threads;
-    transpose_2d_kernel<<<blocks, threads>>>(input, output, rows, cols);
+    batched_transpose_2d_cuda(input, output, 1, rows, cols);
 }
 
 // Batched transpose: batch matrices of [rows, cols] -> [cols, rows]
-// input: [batch, rows, cols], output: [batch, cols, rows], stride = rows*cols per batch element
+// Uses shared memory tiles for coalesced reads AND writes.
+#define TILE_DIM 32
+#define BLOCK_ROWS 8
 __global__ void batched_transpose_2d_kernel(const float* input, float* output,
                                              int64_t batch, int64_t rows, int64_t cols) {
-    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int64_t mat_size = rows * cols;
-    int64_t total = batch * mat_size;
-    if (idx >= total) return;
-    int64_t b = idx / mat_size;
-    int64_t rem = idx % mat_size;
-    int64_t r = rem / cols;
-    int64_t c = rem % cols;
-    output[b * mat_size + c * rows + r] = input[b * mat_size + r * cols + c];
+    __shared__ float tile[TILE_DIM][TILE_DIM + 1]; // +1 avoids bank conflicts
+
+    int64_t b = blockIdx.z;
+    if (b >= batch) return;
+    const float* in = input + b * rows * cols;
+    float* out = output + b * rows * cols;
+
+    // Block position in the matrix
+    int bx = blockIdx.x * TILE_DIM;
+    int by = blockIdx.y * TILE_DIM;
+
+    // Load tile with coalesced reads: reading rows [by..by+TILE_DIM) cols [bx..bx+TILE_DIM)
+    for (int j = 0; j < TILE_DIM; j += BLOCK_ROWS) {
+        int r = by + threadIdx.y + j;
+        int c = bx + threadIdx.x;
+        if (r < rows && c < cols)
+            tile[threadIdx.y + j][threadIdx.x] = in[r * cols + c];
+    }
+    __syncthreads();
+
+    // Write transposed tile with coalesced writes
+    // Output position: rows [bx..bx+TILE_DIM) cols [by..by+TILE_DIM)
+    for (int j = 0; j < TILE_DIM; j += BLOCK_ROWS) {
+        int r = bx + threadIdx.y + j;
+        int c = by + threadIdx.x;
+        if (r < cols && c < rows)
+            out[r * rows + c] = tile[threadIdx.x][threadIdx.y + j];
+    }
 }
 
 void batched_transpose_2d_cuda(const float* input, float* output,
                                 int64_t batch, int64_t rows, int64_t cols) {
-    int64_t total = batch * rows * cols;
-    int threads = 256;
-    int blocks = (total + threads - 1) / threads;
+    dim3 threads(TILE_DIM, BLOCK_ROWS);
+    dim3 blocks((cols + TILE_DIM - 1) / TILE_DIM,
+                (rows + TILE_DIM - 1) / TILE_DIM,
+                batch);
     batched_transpose_2d_kernel<<<blocks, threads>>>(input, output, batch, rows, cols);
 }
+#undef TILE_DIM
+#undef BLOCK_ROWS
 
 // ============================================================================
 // Concatenate two tensors along a specified dimension
@@ -607,17 +662,29 @@ void concat_first_dim_cuda(const float* a, const float* b, float* out,
 
 __global__ void gated_residual_kernel(const float* x, const float* y, const float* gate,
                                        float* out, int64_t M, int64_t C) {
-    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= M * C) return;
-    int64_t c = idx % C;
-    out[idx] = x[idx] + gate[c] * y[idx];
+    int64_t idx = ((int64_t)blockIdx.x * blockDim.x + threadIdx.x) * 4;
+    int64_t total = M * C;
+    if (idx + 3 < total) {
+        float4 vx = *reinterpret_cast<const float4*>(x + idx);
+        float4 vy = *reinterpret_cast<const float4*>(y + idx);
+        int64_t c0 = idx % C, c1 = (idx+1) % C, c2 = (idx+2) % C, c3 = (idx+3) % C;
+        float4 r = {vx.x + gate[c0] * vy.x, vx.y + gate[c1] * vy.y,
+                    vx.z + gate[c2] * vy.z, vx.w + gate[c3] * vy.w};
+        *reinterpret_cast<float4*>(out + idx) = r;
+    } else {
+        for (int64_t j = idx; j < total && j < idx + 4; j++) {
+            int64_t c = j % C;
+            out[j] = x[j] + gate[c] * y[j];
+        }
+    }
 }
 
 void gated_residual_cuda(const float* x, const float* y, const float* gate,
                          float* out, int64_t M, int64_t C) {
     int64_t total = M * C;
     int threads = 256;
-    int blocks = (total + threads - 1) / threads;
+    int64_t work = (total + 3) / 4;
+    int blocks = (work + threads - 1) / threads;
     gated_residual_kernel<<<blocks, threads>>>(x, y, gate, out, M, C);
 }
 
@@ -743,39 +810,42 @@ __global__ void softmax_kernel(const float* x, float* out, int64_t rows, int64_t
     float* or_ = out + row * C;
 
     extern __shared__ float sdata[];
+    float* smax = sdata;
+    float* ssum = sdata + blockDim.x;
 
-    // Find max
-    float max_val = -FLT_MAX;
+    // Online softmax: find max AND compute exp sum in a single pass
+    float local_max = -FLT_MAX;
+    float local_sum = 0.0f;
     for (int64_t i = threadIdx.x; i < C; i += blockDim.x) {
-        max_val = fmaxf(max_val, xr[i]);
+        float v = xr[i];
+        if (v > local_max) {
+            local_sum = local_sum * expf(local_max - v) + 1.0f;
+            local_max = v;
+        } else {
+            local_sum += expf(v - local_max);
+        }
     }
-    sdata[threadIdx.x] = max_val;
+    smax[threadIdx.x] = local_max;
+    ssum[threadIdx.x] = local_sum;
     __syncthreads();
+
     for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (threadIdx.x < s) sdata[threadIdx.x] = fmaxf(sdata[threadIdx.x], sdata[threadIdx.x + s]);
+        if (threadIdx.x < s) {
+            float m1 = smax[threadIdx.x];
+            float m2 = smax[threadIdx.x + s];
+            float new_max = fmaxf(m1, m2);
+            ssum[threadIdx.x] = ssum[threadIdx.x] * expf(m1 - new_max)
+                              + ssum[threadIdx.x + s] * expf(m2 - new_max);
+            smax[threadIdx.x] = new_max;
+        }
         __syncthreads();
     }
-    max_val = sdata[0];
-    __syncthreads();
-
-    // Compute exp sum
-    float sum = 0.0f;
-    for (int64_t i = threadIdx.x; i < C; i += blockDim.x) {
-        float e = expf(xr[i] - max_val);
-        or_[i] = e;
-        sum += e;
-    }
-    sdata[threadIdx.x] = sum;
-    __syncthreads();
-    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (threadIdx.x < s) sdata[threadIdx.x] += sdata[threadIdx.x + s];
-        __syncthreads();
-    }
-    float inv_sum = 1.0f / sdata[0];
+    float max_val = smax[0];
+    float inv_sum = 1.0f / ssum[0];
     __syncthreads();
 
     for (int64_t i = threadIdx.x; i < C; i += blockDim.x) {
-        or_[i] *= inv_sum;
+        or_[i] = expf(xr[i] - max_val) * inv_sum;
     }
 }
 
@@ -784,7 +854,7 @@ void softmax_cuda(const float* x, float* out, int64_t rows, int64_t C) {
     int t = 1;
     while (t < threads) t *= 2;
     threads = t;
-    softmax_kernel<<<rows, threads, threads * sizeof(float)>>>(x, out, rows, C);
+    softmax_kernel<<<rows, threads, 2 * threads * sizeof(float)>>>(x, out, rows, C);
 }
 
 // ============================================================================
@@ -800,41 +870,45 @@ __global__ void softmax_with_mask_kernel(const float* x, const float* mask, floa
     float* or_ = out + row * C;
 
     extern __shared__ float sdata[];
+    float* smax = sdata;
+    float* ssum = sdata + blockDim.x;
 
-    // Find max (with mask applied)
-    float max_val = -FLT_MAX;
+    // Online softmax: find max AND compute exp sum in a single pass
+    float local_max = -FLT_MAX;
+    float local_sum = 0.0f;
     for (int64_t i = threadIdx.x; i < C; i += blockDim.x) {
         float v = mask ? xr[i] + mask[i] : xr[i];
-        max_val = fmaxf(max_val, v);
+        if (v > local_max) {
+            local_sum = local_sum * expf(local_max - v) + 1.0f;
+            local_max = v;
+        } else {
+            local_sum += expf(v - local_max);
+        }
     }
-    sdata[threadIdx.x] = max_val;
-    __syncthreads();
-    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (threadIdx.x < s) sdata[threadIdx.x] = fmaxf(sdata[threadIdx.x], sdata[threadIdx.x + s]);
-        __syncthreads();
-    }
-    max_val = sdata[0];
+    smax[threadIdx.x] = local_max;
+    ssum[threadIdx.x] = local_sum;
     __syncthreads();
 
-    // Compute exp sum (with mask applied)
-    float sum = 0.0f;
+    // Parallel reduction combining max and sum
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) {
+            float m1 = smax[threadIdx.x];
+            float m2 = smax[threadIdx.x + s];
+            float new_max = fmaxf(m1, m2);
+            ssum[threadIdx.x] = ssum[threadIdx.x] * expf(m1 - new_max)
+                              + ssum[threadIdx.x + s] * expf(m2 - new_max);
+            smax[threadIdx.x] = new_max;
+        }
+        __syncthreads();
+    }
+    float max_val = smax[0];
+    float inv_sum = 1.0f / ssum[0];
+    __syncthreads();
+
+    // Single normalize pass (writes output)
     for (int64_t i = threadIdx.x; i < C; i += blockDim.x) {
         float v = mask ? xr[i] + mask[i] : xr[i];
-        float e = expf(v - max_val);
-        or_[i] = e;
-        sum += e;
-    }
-    sdata[threadIdx.x] = sum;
-    __syncthreads();
-    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (threadIdx.x < s) sdata[threadIdx.x] += sdata[threadIdx.x + s];
-        __syncthreads();
-    }
-    float inv_sum = 1.0f / sdata[0];
-    __syncthreads();
-
-    for (int64_t i = threadIdx.x; i < C; i += blockDim.x) {
-        or_[i] *= inv_sum;
+        or_[i] = expf(v - max_val) * inv_sum;
     }
 }
 
@@ -844,7 +918,7 @@ void softmax_with_mask_cuda(const float* x, const float* mask, float* out,
     int t = 1;
     while (t < threads) t *= 2;
     threads = t;
-    softmax_with_mask_kernel<<<rows, threads, threads * sizeof(float)>>>(x, mask, out, rows, C);
+    softmax_with_mask_kernel<<<rows, threads, 2 * threads * sizeof(float)>>>(x, mask, out, rows, C);
 }
 
 // ============================================================================
