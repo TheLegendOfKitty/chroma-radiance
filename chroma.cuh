@@ -454,14 +454,18 @@ struct ChromaRadiance {
         modulate_cuda(img.f32(), img_shift1, img_scale1, img_mod.f32(),
                       img_tokens, hidden_size, 1e-6f);
 
-        Tensor img_qkv = linear_forward(img_mod, w.img_qkv_w, &w.img_qkv_b);
-        // QKV is [img_tokens, 9216] row-major; Q=cols[0:3072], K=cols[3072:6144], V=cols[6144:9216]
-        Tensor img_q = Tensor::alloc({img_tokens, (int64_t)hidden_size}, DType::F32, true);
-        Tensor img_k = Tensor::alloc({img_tokens, (int64_t)hidden_size}, DType::F32, true);
-        Tensor img_v = Tensor::alloc({img_tokens, (int64_t)hidden_size}, DType::F32, true);
-        slice_columns_cuda(img_qkv.f32(), img_q.f32(), img_tokens, 3 * hidden_size, 0, hidden_size);
-        slice_columns_cuda(img_qkv.f32(), img_k.f32(), img_tokens, 3 * hidden_size, hidden_size, hidden_size);
-        slice_columns_cuda(img_qkv.f32(), img_v.f32(), img_tokens, 3 * hidden_size, 2 * hidden_size, hidden_size);
+        // Separate Q/K/V projections using weight views (eliminates slice_columns)
+        size_t qkv_row_bytes = (int64_t)hidden_size * dtype_size(w.img_qkv_w.dtype);
+        Tensor iq_w = Tensor::wrap_gpu(w.img_qkv_w.data, {(int64_t)hidden_size, (int64_t)hidden_size}, w.img_qkv_w.dtype);
+        Tensor ik_w = Tensor::wrap_gpu((char*)w.img_qkv_w.data + qkv_row_bytes * hidden_size, {(int64_t)hidden_size, (int64_t)hidden_size}, w.img_qkv_w.dtype);
+        Tensor iv_w = Tensor::wrap_gpu((char*)w.img_qkv_w.data + qkv_row_bytes * 2 * hidden_size, {(int64_t)hidden_size, (int64_t)hidden_size}, w.img_qkv_w.dtype);
+        Tensor iq_b = Tensor::wrap_gpu(w.img_qkv_b.f32(), {(int64_t)hidden_size}, DType::F32);
+        Tensor ik_b = Tensor::wrap_gpu(w.img_qkv_b.f32() + hidden_size, {(int64_t)hidden_size}, DType::F32);
+        Tensor iv_b = Tensor::wrap_gpu(w.img_qkv_b.f32() + 2 * hidden_size, {(int64_t)hidden_size}, DType::F32);
+
+        Tensor img_q = linear_forward(img_mod, iq_w, &iq_b);
+        Tensor img_k = linear_forward(img_mod, ik_w, &ik_b);
+        Tensor img_v = linear_forward(img_mod, iv_w, &iv_b);
 
         qk_norm(img_q.f32(), w.img_q_norm.f32(), img_tokens, num_heads, d_head);
         qk_norm(img_k.f32(), w.img_k_norm.f32(), img_tokens, num_heads, d_head);
@@ -471,14 +475,17 @@ struct ChromaRadiance {
         modulate_cuda(txt.f32(), txt_shift1, txt_scale1, txt_mod_t.f32(),
                       txt_tokens, hidden_size, 1e-6f);
 
-        Tensor txt_qkv = linear_forward(txt_mod_t, w.txt_qkv_w, &w.txt_qkv_b);
-        // QKV is [txt_tokens, 9216] row-major; Q=cols[0:3072], K=cols[3072:6144], V=cols[6144:9216]
-        Tensor txt_q = Tensor::alloc({txt_tokens, (int64_t)hidden_size}, DType::F32, true);
-        Tensor txt_k = Tensor::alloc({txt_tokens, (int64_t)hidden_size}, DType::F32, true);
-        Tensor txt_v = Tensor::alloc({txt_tokens, (int64_t)hidden_size}, DType::F32, true);
-        slice_columns_cuda(txt_qkv.f32(), txt_q.f32(), txt_tokens, 3 * hidden_size, 0, hidden_size);
-        slice_columns_cuda(txt_qkv.f32(), txt_k.f32(), txt_tokens, 3 * hidden_size, hidden_size, hidden_size);
-        slice_columns_cuda(txt_qkv.f32(), txt_v.f32(), txt_tokens, 3 * hidden_size, 2 * hidden_size, hidden_size);
+        // Separate Q/K/V projections using weight views
+        Tensor tq_w = Tensor::wrap_gpu(w.txt_qkv_w.data, {(int64_t)hidden_size, (int64_t)hidden_size}, w.txt_qkv_w.dtype);
+        Tensor tk_w = Tensor::wrap_gpu((char*)w.txt_qkv_w.data + qkv_row_bytes * hidden_size, {(int64_t)hidden_size, (int64_t)hidden_size}, w.txt_qkv_w.dtype);
+        Tensor tv_w = Tensor::wrap_gpu((char*)w.txt_qkv_w.data + qkv_row_bytes * 2 * hidden_size, {(int64_t)hidden_size, (int64_t)hidden_size}, w.txt_qkv_w.dtype);
+        Tensor tq_b = Tensor::wrap_gpu(w.txt_qkv_b.f32(), {(int64_t)hidden_size}, DType::F32);
+        Tensor tk_b = Tensor::wrap_gpu(w.txt_qkv_b.f32() + hidden_size, {(int64_t)hidden_size}, DType::F32);
+        Tensor tv_b = Tensor::wrap_gpu(w.txt_qkv_b.f32() + 2 * hidden_size, {(int64_t)hidden_size}, DType::F32);
+
+        Tensor txt_q = linear_forward(txt_mod_t, tq_w, &tq_b);
+        Tensor txt_k = linear_forward(txt_mod_t, tk_w, &tk_b);
+        Tensor txt_v = linear_forward(txt_mod_t, tv_w, &tv_b);
 
         qk_norm(txt_q.f32(), w.txt_q_norm.f32(), txt_tokens, num_heads, d_head);
         qk_norm(txt_k.f32(), w.txt_k_norm.f32(), txt_tokens, num_heads, d_head);
@@ -559,19 +566,27 @@ struct ChromaRadiance {
         Tensor x_mod = Tensor::alloc({L, (int64_t)hidden_size}, DType::F32, true);
         modulate_cuda(x.f32(), shift, scale, x_mod.f32(), L, hidden_size, 1e-6f);
 
-        // linear1: [L, 21504] = [L, 3*3072 + 12288]
-        Tensor qkv_mlp = linear_forward(x_mod, w.linear1_w, &w.linear1_b);
-        int64_t total_cols = 3 * hidden_size + mlp_hidden; // 21504
+        // Separate Q/K/V/MLP projections using weight views (eliminates slice_columns)
+        // linear1_w is [21504, 3072]: rows [0:3072]=Q, [3072:6144]=K, [6144:9216]=V, [9216:21504]=MLP
+        size_t l1_row_bytes = (int64_t)hidden_size * dtype_size(w.linear1_w.dtype);
+        Tensor sq_w = Tensor::wrap_gpu(w.linear1_w.data,
+                                        {(int64_t)hidden_size, (int64_t)hidden_size}, w.linear1_w.dtype);
+        Tensor sk_w = Tensor::wrap_gpu((char*)w.linear1_w.data + l1_row_bytes * hidden_size,
+                                        {(int64_t)hidden_size, (int64_t)hidden_size}, w.linear1_w.dtype);
+        Tensor sv_w = Tensor::wrap_gpu((char*)w.linear1_w.data + l1_row_bytes * 2 * hidden_size,
+                                        {(int64_t)hidden_size, (int64_t)hidden_size}, w.linear1_w.dtype);
+        Tensor sm_w = Tensor::wrap_gpu((char*)w.linear1_w.data + l1_row_bytes * 3 * hidden_size,
+                                        {(int64_t)mlp_hidden, (int64_t)hidden_size}, w.linear1_w.dtype);
+        // Split bias [21504] into Q[0:3072], K[3072:6144], V[6144:9216], MLP[9216:21504]
+        Tensor sq_b = Tensor::wrap_gpu(w.linear1_b.f32(), {(int64_t)hidden_size}, DType::F32);
+        Tensor sk_b = Tensor::wrap_gpu(w.linear1_b.f32() + hidden_size, {(int64_t)hidden_size}, DType::F32);
+        Tensor sv_b = Tensor::wrap_gpu(w.linear1_b.f32() + 2 * hidden_size, {(int64_t)hidden_size}, DType::F32);
+        Tensor sm_b = Tensor::wrap_gpu(w.linear1_b.f32() + 3 * hidden_size, {(int64_t)mlp_hidden}, DType::F32);
 
-        // Split: Q(3072), K(3072), V(3072), MLP(12288) - column slices from row-major [L, 21504]
-        Tensor q_t = Tensor::alloc({L, (int64_t)hidden_size}, DType::F32, true);
-        Tensor k_t = Tensor::alloc({L, (int64_t)hidden_size}, DType::F32, true);
-        Tensor v_t = Tensor::alloc({L, (int64_t)hidden_size}, DType::F32, true);
-        Tensor mlp_t = Tensor::alloc({L, (int64_t)mlp_hidden}, DType::F32, true);
-        slice_columns_cuda(qkv_mlp.f32(), q_t.f32(), L, total_cols, 0, hidden_size);
-        slice_columns_cuda(qkv_mlp.f32(), k_t.f32(), L, total_cols, hidden_size, hidden_size);
-        slice_columns_cuda(qkv_mlp.f32(), v_t.f32(), L, total_cols, 2 * hidden_size, hidden_size);
-        slice_columns_cuda(qkv_mlp.f32(), mlp_t.f32(), L, total_cols, 3 * hidden_size, mlp_hidden);
+        Tensor q_t = linear_forward(x_mod, sq_w, &sq_b);
+        Tensor k_t = linear_forward(x_mod, sk_w, &sk_b);
+        Tensor v_t = linear_forward(x_mod, sv_w, &sv_b);
+        Tensor mlp_t = linear_forward(x_mod, sm_w, &sm_b);
 
         // QKNorm
         qk_norm(q_t.f32(), w.q_norm.f32(), L, num_heads, d_head);
@@ -627,16 +642,11 @@ struct ChromaRadiance {
         CHECK_CUDA(cudaMemcpy(dct_gpu.data, dct_features.data(),
                               dct_features.size() * sizeof(float), cudaMemcpyHostToDevice));
 
-        // Broadcast DCT to [num_patches, 256, 64]
+        // Broadcast DCT to [num_patches, 256, 64] using single kernel
         Tensor dct_broad = Tensor::alloc({(int64_t)num_patches, (int64_t)pixels_per_patch,
                                            (int64_t)(nerf_max_freqs * nerf_max_freqs)}, DType::F32, true);
-        for (int i = 0; i < num_patches; i++) {
-            CHECK_CUDA(cudaMemcpy(
-                (float*)dct_broad.data + i * pixels_per_patch * nerf_max_freqs * nerf_max_freqs,
-                dct_gpu.data,
-                pixels_per_patch * nerf_max_freqs * nerf_max_freqs * sizeof(float),
-                cudaMemcpyDeviceToDevice));
-        }
+        broadcast_rows_cuda(dct_gpu.f32(), dct_broad.f32(), num_patches,
+                            pixels_per_patch, nerf_max_freqs * nerf_max_freqs);
 
         // Concat: [num_patches, 256, 3] + [num_patches, 256, 64] → [num_patches, 256, 67]
         int64_t feat_dim = 3 + nerf_max_freqs * nerf_max_freqs; // 67
@@ -757,19 +767,14 @@ struct ChromaRadiance {
         Tensor x_normed = Tensor::alloc({batch, seq, hid}, DType::F32, true);
         rms_norm_cuda(x.f32(), w.norm_scale.f32(), x_normed.f32(), batch * seq, hid, 1e-6f);
 
-        // Transpose weight matrices for batched matmul: C = A @ B
-        Tensor w_gate_t = Tensor::alloc({batch, hid, mlp_dim}, DType::F32, true);
-        Tensor w_value_t = Tensor::alloc({batch, hid, mlp_dim}, DType::F32, true);
-        Tensor w_fc2_t = Tensor::alloc({batch, mlp_dim, hid}, DType::F32, true);
-        batched_transpose_2d_cuda(w_gate.f32(), w_gate_t.f32(), batch, mlp_dim, hid);
-        batched_transpose_2d_cuda(w_value.f32(), w_value_t.f32(), batch, mlp_dim, hid);
-        batched_transpose_2d_cuda(w_fc2.f32(), w_fc2_t.f32(), batch, hid, mlp_dim);
-
+        // Batched matmul with B transposed — eliminates 3 transpose operations
+        // w_gate [batch, mlp_dim, hid]: x_normed @ w_gate^T = [batch, seq, hid] @ [batch, hid, mlp_dim]
+        // w_value [batch, mlp_dim, hid]: same
         Tensor x1 = Tensor::alloc({batch, seq, mlp_dim}, DType::F32, true);
         Tensor x2 = Tensor::alloc({batch, seq, mlp_dim}, DType::F32, true);
 
-        batched_matmul(x_normed, w_gate_t, x1);
-        batched_matmul(x_normed, w_value_t, x2);
+        batched_matmul_Bt(x_normed, w_gate, x1);
+        batched_matmul_Bt(x_normed, w_value, x2);
 
         // SiLU on x1
         silu_cuda(x1.f32(), x1.f32(), batch * seq * mlp_dim);
@@ -778,8 +783,9 @@ struct ChromaRadiance {
         mul_cuda(x1.f32(), x2.f32(), x1.f32(), batch * seq * mlp_dim);
 
         // x = x1 @ w_fc2^T = [batch, seq, mlp_dim] @ [batch, mlp_dim, hid]
+        // w_fc2 [batch, hid, mlp_dim]: x1 @ w_fc2^T = [batch, seq, mlp_dim] @ [batch, mlp_dim, hid]
         Tensor x_out = Tensor::alloc({batch, seq, hid}, DType::F32, true);
-        batched_matmul(x1, w_fc2_t, x_out);
+        batched_matmul_Bt(x1, w_fc2, x_out);
 
         // Residual
         add_cuda(x_out.f32(), res.f32(), x.f32(), batch * seq * hid);

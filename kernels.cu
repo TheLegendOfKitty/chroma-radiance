@@ -20,8 +20,20 @@ __global__ void fp16_to_f32_kernel(const __half* src, float* dst, int64_t n) {
 }
 
 __global__ void f32_to_bf16_kernel(const float* src, __nv_bfloat16* dst, int64_t n) {
-    int64_t i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) dst[i] = __float2bfloat16(src[i]);
+    int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    int64_t idx = i * 4;
+    if (idx + 3 < n) {
+        float4 v = *reinterpret_cast<const float4*>(src + idx);
+        __nv_bfloat162 a = __floats2bfloat162_rn(v.x, v.y);
+        __nv_bfloat162 b = __floats2bfloat162_rn(v.z, v.w);
+        *reinterpret_cast<__nv_bfloat162*>(dst + idx) = a;
+        *reinterpret_cast<__nv_bfloat162*>(dst + idx + 2) = b;
+    } else {
+        // Tail handling
+        for (int64_t j = idx; j < n && j < idx + 4; j++) {
+            dst[j] = __float2bfloat16(src[j]);
+        }
+    }
 }
 
 __global__ void f32_to_fp16_kernel(const float* src, __half* dst, int64_t n) {
@@ -43,7 +55,8 @@ void fp16_to_f32_cuda(const __half* src, float* dst, int64_t n) {
 
 void f32_to_bf16_cuda(const float* src, __nv_bfloat16* dst, int64_t n) {
     int threads = 256;
-    int blocks = (n + threads - 1) / threads;
+    int64_t work_items = (n + 3) / 4;  // each thread handles 4 elements
+    int blocks = (work_items + threads - 1) / threads;
     f32_to_bf16_kernel<<<blocks, threads>>>(src, dst, n);
 }
 
@@ -775,6 +788,66 @@ void softmax_cuda(const float* x, float* out, int64_t rows, int64_t C) {
 }
 
 // ============================================================================
+// Fused softmax + attention mask: scores[row, col] += mask[col], then softmax
+// mask can be nullptr (no mask applied)
+// ============================================================================
+
+__global__ void softmax_with_mask_kernel(const float* x, const float* mask, float* out,
+                                          int64_t rows, int64_t C) {
+    int64_t row = blockIdx.x;
+    if (row >= rows) return;
+    const float* xr = x + row * C;
+    float* or_ = out + row * C;
+
+    extern __shared__ float sdata[];
+
+    // Find max (with mask applied)
+    float max_val = -FLT_MAX;
+    for (int64_t i = threadIdx.x; i < C; i += blockDim.x) {
+        float v = mask ? xr[i] + mask[i] : xr[i];
+        max_val = fmaxf(max_val, v);
+    }
+    sdata[threadIdx.x] = max_val;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) sdata[threadIdx.x] = fmaxf(sdata[threadIdx.x], sdata[threadIdx.x + s]);
+        __syncthreads();
+    }
+    max_val = sdata[0];
+    __syncthreads();
+
+    // Compute exp sum (with mask applied)
+    float sum = 0.0f;
+    for (int64_t i = threadIdx.x; i < C; i += blockDim.x) {
+        float v = mask ? xr[i] + mask[i] : xr[i];
+        float e = expf(v - max_val);
+        or_[i] = e;
+        sum += e;
+    }
+    sdata[threadIdx.x] = sum;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) sdata[threadIdx.x] += sdata[threadIdx.x + s];
+        __syncthreads();
+    }
+    float inv_sum = 1.0f / sdata[0];
+    __syncthreads();
+
+    for (int64_t i = threadIdx.x; i < C; i += blockDim.x) {
+        or_[i] *= inv_sum;
+    }
+}
+
+void softmax_with_mask_cuda(const float* x, const float* mask, float* out,
+                             int64_t rows, int64_t C) {
+    int threads = min((int64_t)256, C);
+    int t = 1;
+    while (t < threads) t *= 2;
+    threads = t;
+    softmax_with_mask_kernel<<<rows, threads, threads * sizeof(float)>>>(x, mask, out, rows, C);
+}
+
+// ============================================================================
 // Copy kernel (for non-contiguous copies, permutations, etc.)
 // ============================================================================
 
@@ -1068,4 +1141,45 @@ void apply_attention_mask_cuda(float* scores, const float* mask,
     int threads = 256;
     int blocks = (int)((total + threads - 1) / threads);
     apply_attention_mask_kernel<<<blocks, threads>>>(scores, mask, L_k, total);
+}
+
+// ============================================================================
+// Post-GEMM bias add: data[i*N + j] += bias[j]
+// data: [M, N], bias: [N]
+// ============================================================================
+
+__global__ void add_bias_kernel(float* data, const float* bias, int64_t M, int64_t N) {
+    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < M * N) {
+        int64_t j = idx % N;
+        data[idx] += bias[j];
+    }
+}
+
+void add_bias_cuda(float* data, const float* bias, int64_t M, int64_t N) {
+    int threads = 256;
+    int blocks = (int)((M * N + threads - 1) / threads);
+    add_bias_kernel<<<blocks, threads>>>(data, bias, M, N);
+}
+
+// ============================================================================
+// Broadcast rows: copy src[seq, feat] into each of batch slices of dst[batch, seq, feat]
+// ============================================================================
+
+__global__ void broadcast_rows_kernel(const float* src, float* dst,
+                                       int64_t batch, int64_t seq_feat) {
+    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int64_t total = batch * seq_feat;
+    if (idx >= total) return;
+    int64_t sf = idx % seq_feat;
+    dst[idx] = src[sf];
+}
+
+void broadcast_rows_cuda(const float* src, float* dst,
+                          int64_t batch, int64_t seq, int64_t feat) {
+    int64_t seq_feat = seq * feat;
+    int64_t total = batch * seq_feat;
+    int threads = 256;
+    int blocks = (int)((total + threads - 1) / threads);
+    broadcast_rows_kernel<<<blocks, threads>>>(src, dst, batch, seq_feat);
 }

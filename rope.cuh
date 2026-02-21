@@ -170,3 +170,97 @@ void apply_rope_cuda(const float* x, const float* pe, float* out,
     int blocks = (total + threads - 1) / threads;
     apply_rope_kernel<<<blocks, threads>>>(x, pe, out, N_heads, L, d_head);
 }
+
+// ============================================================================
+// Fused permute + RoPE + F32→BF16 kernel
+// Reads from [L, N_heads, d_head] layout, applies RoPE, writes BF16 to [N_heads, L, d_head]
+// Fuses 3 operations: permute_4d + apply_rope + f32_to_bf16
+// ============================================================================
+
+__global__ void apply_rope_fused_bf16_kernel(const float* x, const float* pe,
+                                              __nv_bfloat16* out,
+                                              int N_heads, int L, int d_head) {
+    int half_d = d_head / 2;
+    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int64_t total = (int64_t)N_heads * L * half_d;
+    if (idx >= total) return;
+
+    int h = idx / (L * half_d);
+    int rem = idx % (L * half_d);
+    int l = rem / half_d;
+    int j = rem % half_d;
+
+    // Read from [L, N_heads, d_head] layout
+    int64_t in_base = (int64_t)l * N_heads * d_head + h * d_head;
+    float x_even = x[in_base + 2 * j];
+    float x_odd  = x[in_base + 2 * j + 1];
+
+    // RoPE rotation
+    int pe_base = l * half_d * 4 + j * 4;
+    float pe_cos     = pe[pe_base + 0];
+    float pe_neg_sin = pe[pe_base + 1];
+    float pe_sin     = pe[pe_base + 2];
+    float pe_cos2    = pe[pe_base + 3];
+
+    float out_even = x_even * pe_cos     + x_odd * pe_neg_sin;
+    float out_odd  = x_even * pe_sin     + x_odd * pe_cos2;
+
+    // Write to [N_heads, L, d_head] layout in BF16
+    int64_t out_base = (int64_t)h * L * d_head + l * d_head;
+    out[out_base + 2 * j]     = __float2bfloat16(out_even);
+    out[out_base + 2 * j + 1] = __float2bfloat16(out_odd);
+}
+
+void apply_rope_fused_bf16_cuda(const float* x, const float* pe, __nv_bfloat16* out,
+                                 int N_heads, int L, int d_head) {
+    int half_d = d_head / 2;
+    int64_t total = (int64_t)N_heads * L * half_d;
+    int threads = 256;
+    int blocks = (total + threads - 1) / threads;
+    apply_rope_fused_bf16_kernel<<<blocks, threads>>>(x, pe, out, N_heads, L, d_head);
+}
+
+// F32 variant: reads [L, N_heads, d_head], applies RoPE, writes F32 to [N_heads, L, d_head]
+// Used when BF16 attention is not desired (e.g., T5)
+__global__ void apply_rope_fused_f32_kernel(const float* x, const float* pe,
+                                             float* out,
+                                             int N_heads, int L, int d_head) {
+    int half_d = d_head / 2;
+    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int64_t total = (int64_t)N_heads * L * half_d;
+    if (idx >= total) return;
+
+    int h = idx / (L * half_d);
+    int rem = idx % (L * half_d);
+    int l = rem / half_d;
+    int j = rem % half_d;
+
+    // Read from [L, N_heads, d_head] layout
+    int64_t in_base = (int64_t)l * N_heads * d_head + h * d_head;
+    float x_even = x[in_base + 2 * j];
+    float x_odd  = x[in_base + 2 * j + 1];
+
+    // RoPE rotation
+    int pe_base = l * half_d * 4 + j * 4;
+    float pe_cos     = pe[pe_base + 0];
+    float pe_neg_sin = pe[pe_base + 1];
+    float pe_sin     = pe[pe_base + 2];
+    float pe_cos2    = pe[pe_base + 3];
+
+    float out_even = x_even * pe_cos     + x_odd * pe_neg_sin;
+    float out_odd  = x_even * pe_sin     + x_odd * pe_cos2;
+
+    // Write to [N_heads, L, d_head] layout in F32
+    int64_t out_base = (int64_t)h * L * d_head + l * d_head;
+    out[out_base + 2 * j]     = out_even;
+    out[out_base + 2 * j + 1] = out_odd;
+}
+
+void apply_rope_fused_f32_cuda(const float* x, const float* pe, float* out,
+                                int N_heads, int L, int d_head) {
+    int half_d = d_head / 2;
+    int64_t total = (int64_t)N_heads * L * half_d;
+    int threads = 256;
+    int blocks = (total + threads - 1) / threads;
+    apply_rope_fused_f32_kernel<<<blocks, threads>>>(x, pe, out, N_heads, L, d_head);
+}
