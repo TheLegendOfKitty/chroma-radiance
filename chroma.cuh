@@ -825,6 +825,10 @@ struct ChromaRadiance {
     Tensor forward(const Tensor& x, const Tensor& context, float timestep,
                     const Tensor& pe, const std::vector<float>& dct_features,
                     const float* attn_mask = nullptr) {
+        // Release cached activation buffers from the previous forward pass
+        // (different phases use incompatible sizes, so stale caches just waste VRAM)
+        gpu_pool().release_all();
+
         int H = x.shape[2], W = x.shape[3];
         int64_t txt_tokens = context.shape[0];
         bool diag = debug_diag && (fwd_call_count == 0);  // diagnostics on first call only
@@ -941,6 +945,9 @@ struct ChromaRadiance {
         if (diag) {
             print_tensor_stats("transformer_out (img_out)", img_out.f32(), img_out.numel());
         }
+
+        // Release cached single-block activation buffers (not reused by NeRF)
+        gpu_pool().release_all();
 
         // 8. NeRF decode
         Tensor output = nerf_decode(img_out, x, dct_features, H, W);
