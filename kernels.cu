@@ -513,6 +513,29 @@ void transpose_2d_cuda(const float* input, float* output, int64_t rows, int64_t 
     transpose_2d_kernel<<<blocks, threads>>>(input, output, rows, cols);
 }
 
+// Batched transpose: batch matrices of [rows, cols] -> [cols, rows]
+// input: [batch, rows, cols], output: [batch, cols, rows], stride = rows*cols per batch element
+__global__ void batched_transpose_2d_kernel(const float* input, float* output,
+                                             int64_t batch, int64_t rows, int64_t cols) {
+    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int64_t mat_size = rows * cols;
+    int64_t total = batch * mat_size;
+    if (idx >= total) return;
+    int64_t b = idx / mat_size;
+    int64_t rem = idx % mat_size;
+    int64_t r = rem / cols;
+    int64_t c = rem % cols;
+    output[b * mat_size + c * rows + r] = input[b * mat_size + r * cols + c];
+}
+
+void batched_transpose_2d_cuda(const float* input, float* output,
+                                int64_t batch, int64_t rows, int64_t cols) {
+    int64_t total = batch * rows * cols;
+    int threads = 256;
+    int blocks = (total + threads - 1) / threads;
+    batched_transpose_2d_kernel<<<blocks, threads>>>(input, output, batch, rows, cols);
+}
+
 // ============================================================================
 // Concatenate two tensors along a specified dimension
 // For dim=0 (last dim in our row-major convention, first in shape):

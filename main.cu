@@ -78,6 +78,7 @@ struct Args {
     std::string tokenizer_path = "";
     int rng_mode = 1;  // 0 = pytorch, 1 = sd.cpp (default to sd.cpp for comparison)
     bool no_mask = false;
+    bool debug = false;
 };
 
 static Args parse_args(int argc, char** argv) {
@@ -112,6 +113,8 @@ static Args parse_args(int argc, char** argv) {
             else { fprintf(stderr, "Unknown --rng: %s (use pytorch or sdcpp)\n", rng_str.c_str()); exit(1); }
         } else if (strcmp(argv[i], "--no-mask") == 0) {
             args.no_mask = true;
+        } else if (strcmp(argv[i], "--debug") == 0) {
+            args.debug = true;
         } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
             printf("Usage: chroma-radiance [options]\n");
             printf("  -p, --prompt TEXT     Prompt text (default: 'a photo of a cat')\n");
@@ -248,7 +251,7 @@ int main(int argc, char** argv) {
     }
 
     // Print T5 output checksum and dump to file
-    {
+    if (args.debug) {
         int64_t n = context.numel();
         std::vector<float> v(n);
         CHECK_CUDA(cudaMemcpy(v.data(), context.f32(), n * sizeof(float), cudaMemcpyDeviceToHost));
@@ -259,16 +262,16 @@ int main(int argc, char** argv) {
         }
         printf("T5 output checksum: %.6f, mean_abs: %.12f\n", sum, abs_sum / n);
 
-        // Dump conditioned T5 context to binary file for comparison
         FILE* f = fopen("/tmp/t5_context_f32.bin", "wb");
         if (f) { fwrite(v.data(), sizeof(float), n, f); fclose(f); printf("Dumped T5 context to /tmp/t5_context_f32.bin\n"); }
-    }
-    if (use_cfg) {
-        int64_t n = context_uncond.numel();
-        std::vector<float> v(n);
-        CHECK_CUDA(cudaMemcpy(v.data(), context_uncond.f32(), n * sizeof(float), cudaMemcpyDeviceToHost));
-        FILE* f = fopen("/tmp/t5_context_uncond_f32.bin", "wb");
-        if (f) { fwrite(v.data(), sizeof(float), n, f); fclose(f); printf("Dumped uncond T5 context to /tmp/t5_context_uncond_f32.bin\n"); }
+
+        if (use_cfg) {
+            int64_t n2 = context_uncond.numel();
+            std::vector<float> v2(n2);
+            CHECK_CUDA(cudaMemcpy(v2.data(), context_uncond.f32(), n2 * sizeof(float), cudaMemcpyDeviceToHost));
+            FILE* f2 = fopen("/tmp/t5_context_uncond_f32.bin", "wb");
+            if (f2) { fwrite(v2.data(), sizeof(float), n2, f2); fclose(f2); printf("Dumped uncond T5 context to /tmp/t5_context_uncond_f32.bin\n"); }
+        }
     }
 
     // Free T5 weights and close T5 file
@@ -295,6 +298,7 @@ int main(int argc, char** argv) {
     }
 
     ChromaRadiance chroma;
+    chroma.debug_diag = args.debug;
     chroma.load(chroma_file);
 
     // ========================================
@@ -366,7 +370,7 @@ int main(int argc, char** argv) {
     printf("Initialized noise: [1, 3, %d, %d]\n", args.height, args.width);
 
     // Dump noise to file for comparison
-    {
+    if (args.debug) {
         int64_t n = x.numel();
         std::vector<float> v(n);
         CHECK_CUDA(cudaMemcpy(v.data(), x.f32(), n * sizeof(float), cudaMemcpyDeviceToHost));
@@ -390,7 +394,7 @@ int main(int argc, char** argv) {
             add_cuda(velocity_cond.f32(), velocity_uncond.f32(), velocity_cond.f32(), n);
 
             // Diagnostic: print guided velocity stats for step 0
-            if (step == 0) {
+            if (args.debug && step == 0) {
                 std::vector<float> v(n);
                 CHECK_CUDA(cudaMemcpy(v.data(), velocity_cond.f32(), n * sizeof(float), cudaMemcpyDeviceToHost));
                 double sum = 0, abs_sum = 0;
@@ -407,7 +411,7 @@ int main(int argc, char** argv) {
             // Single conditioned pass
             Tensor velocity = chroma.forward(x, context, sigma, pe, dct_features, attn_mask.f32());
 
-            if (step == 0) {
+            if (args.debug && step == 0) {
                 int64_t n = velocity.numel();
                 std::vector<float> v(n);
                 CHECK_CUDA(cudaMemcpy(v.data(), velocity.f32(), n * sizeof(float), cudaMemcpyDeviceToHost));

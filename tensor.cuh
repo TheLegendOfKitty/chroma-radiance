@@ -8,6 +8,7 @@
 #include <cstring>
 #include <cassert>
 #include <vector>
+#include <unordered_map>
 #include <string>
 
 #define CHECK_CUDA(call) do { \
@@ -17,6 +18,47 @@
         exit(1); \
     } \
 } while(0)
+
+// ============================================================================
+// GPU Memory Pool: eliminates cudaMalloc/cudaFree overhead by reusing buffers.
+// Uses a size-bucketed free list. Sizes are rounded up to 256-byte alignment.
+// ============================================================================
+struct GPUMemPool {
+    std::unordered_map<size_t, std::vector<void*>> free_lists;
+
+    void* alloc(size_t bytes) {
+        bytes = (bytes + 255) & ~(size_t)255;
+        auto it = free_lists.find(bytes);
+        if (it != free_lists.end() && !it->second.empty()) {
+            void* ptr = it->second.back();
+            it->second.pop_back();
+            return ptr;
+        }
+        void* ptr = nullptr;
+        CHECK_CUDA(cudaMalloc(&ptr, bytes));
+        return ptr;
+    }
+
+    void free(void* ptr, size_t bytes) {
+        if (!ptr) return;
+        bytes = (bytes + 255) & ~(size_t)255;
+        free_lists[bytes].push_back(ptr);
+    }
+
+    void release_all() {
+        for (auto& [sz, ptrs] : free_lists) {
+            for (void* p : ptrs) cudaFree(p);
+        }
+        free_lists.clear();
+    }
+
+    ~GPUMemPool() { release_all(); }
+};
+
+static GPUMemPool& gpu_pool() {
+    static GPUMemPool pool;
+    return pool;
+}
 
 enum class DType { F32, FP16, BF16 };
 
@@ -74,7 +116,7 @@ struct Tensor {
     void free_data() {
         if (owns_data && data) {
             if (on_gpu) {
-                cudaFree(data);
+                gpu_pool().free(data, nbytes());
             } else {
                 free(data);
             }
@@ -124,7 +166,7 @@ struct Tensor {
         size_t bytes = t.nbytes();
         if (bytes == 0) return t;
         if (gpu) {
-            CHECK_CUDA(cudaMalloc(&t.data, bytes));
+            t.data = gpu_pool().alloc(bytes);
         } else {
             t.data = malloc(bytes);
             assert(t.data);
@@ -147,7 +189,7 @@ struct Tensor {
         size_t bytes = t.nbytes();
         if (bytes == 0) return t;
         if (gpu) {
-            CHECK_CUDA(cudaMalloc(&t.data, bytes));
+            t.data = gpu_pool().alloc(bytes);
         } else {
             t.data = malloc(bytes);
             assert(t.data);

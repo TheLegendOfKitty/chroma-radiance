@@ -40,6 +40,8 @@ void conv2d_3x3_cuda(const float* input, const float* weight, const float* bias,
 void mul_broadcast_cuda(const float* a, const float* b, float* out, int64_t M, int64_t C);
 void broadcast_bias_cuda(const float* bias, float* output, int64_t M, int64_t N);
 void softmax_cuda(const float* x, float* out, int64_t rows, int64_t C);
+void batched_transpose_2d_cuda(const float* input, float* output,
+                                int64_t batch, int64_t rows, int64_t cols);
 void scale_cuda(float* x, float scale, int64_t n);
 void slice_columns_cuda(const float* src, float* dst,
                          int64_t L, int64_t total_cols,
@@ -657,14 +659,9 @@ struct ChromaRadiance {
         Tensor w_value = Tensor::alloc({batch, mlp_dim, hid}, DType::F32, true);
         Tensor w_fc2 = Tensor::alloc({batch, hid, mlp_dim}, DType::F32, true);
 
-        for (int b = 0; b < batch; b++) {
-            transpose_2d_cuda(fc1_gate_t.f32() + b * chunk, w_gate.f32() + b * chunk,
-                             hid, mlp_dim);
-            transpose_2d_cuda(fc1_value_t.f32() + b * chunk, w_value.f32() + b * chunk,
-                             hid, mlp_dim);
-            transpose_2d_cuda(fc2_t.f32() + b * chunk, w_fc2.f32() + b * chunk,
-                             mlp_dim, hid);
-        }
+        batched_transpose_2d_cuda(fc1_gate_t.f32(), w_gate.f32(), batch, hid, mlp_dim);
+        batched_transpose_2d_cuda(fc1_value_t.f32(), w_value.f32(), batch, hid, mlp_dim);
+        batched_transpose_2d_cuda(fc2_t.f32(), w_fc2.f32(), batch, mlp_dim, hid);
 
         // L2 normalize along last dim
         l2_norm_cuda(w_gate.f32(), w_gate.f32(), batch * mlp_dim, hid, 1e-12f);
@@ -683,14 +680,9 @@ struct ChromaRadiance {
         Tensor w_gate_t = Tensor::alloc({batch, hid, mlp_dim}, DType::F32, true);
         Tensor w_value_t = Tensor::alloc({batch, hid, mlp_dim}, DType::F32, true);
         Tensor w_fc2_t = Tensor::alloc({batch, mlp_dim, hid}, DType::F32, true);
-        for (int b = 0; b < batch; b++) {
-            transpose_2d_cuda(w_gate.f32() + b * mlp_dim * hid,
-                             w_gate_t.f32() + b * hid * mlp_dim, mlp_dim, hid);
-            transpose_2d_cuda(w_value.f32() + b * mlp_dim * hid,
-                             w_value_t.f32() + b * hid * mlp_dim, mlp_dim, hid);
-            transpose_2d_cuda(w_fc2.f32() + b * hid * mlp_dim,
-                             w_fc2_t.f32() + b * mlp_dim * hid, hid, mlp_dim);
-        }
+        batched_transpose_2d_cuda(w_gate.f32(), w_gate_t.f32(), batch, mlp_dim, hid);
+        batched_transpose_2d_cuda(w_value.f32(), w_value_t.f32(), batch, mlp_dim, hid);
+        batched_transpose_2d_cuda(w_fc2.f32(), w_fc2_t.f32(), batch, hid, mlp_dim);
 
         Tensor x1 = Tensor::alloc({batch, seq, mlp_dim}, DType::F32, true);
         Tensor x2 = Tensor::alloc({batch, seq, mlp_dim}, DType::F32, true);
@@ -737,8 +729,10 @@ struct ChromaRadiance {
     // Full forward pass
     // ======================================================================
     static int fwd_call_count;
+    static bool debug_diag;
 
     void print_tensor_stats(const char* name, const float* gpu_data, int64_t n) {
+        if (!debug_diag) return;
         std::vector<float> v(n);
         CHECK_CUDA(cudaMemcpy(v.data(), gpu_data, n * sizeof(float), cudaMemcpyDeviceToHost));
         double sum = 0, abs_sum = 0;
@@ -752,7 +746,7 @@ struct ChromaRadiance {
                     const float* attn_mask = nullptr) {
         int H = x.shape[2], W = x.shape[3];
         int64_t txt_tokens = context.shape[0];
-        bool diag = (fwd_call_count == 0);  // diagnostics on first call only
+        bool diag = debug_diag && (fwd_call_count == 0);  // diagnostics on first call only
 
         if (diag) {
             printf("[DIAG] Forward call #0, timestep=%.6f, H=%d, W=%d\n", timestep, H, W);
@@ -879,3 +873,4 @@ struct ChromaRadiance {
 };
 
 int ChromaRadiance::fwd_call_count = 0;
+bool ChromaRadiance::debug_diag = false;

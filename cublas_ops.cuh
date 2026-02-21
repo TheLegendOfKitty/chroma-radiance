@@ -80,29 +80,29 @@ static void linear(const Tensor& x, const Tensor& W, const Tensor* bias, Tensor&
             output.data, CUDA_R_32F, N,
             CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
     } else if (x.dtype == DType::F32 && W.dtype == DType::BF16) {
-        // Mixed: F32 input, BF16 weight — convert W to F32 for full precision
-        // (BF16×BF16 GEMM loses accuracy for large K even with CUBLAS_COMPUTE_32F)
-        Tensor W_f32 = Tensor::alloc_shape(W.ndim, W.shape, DType::F32, true);
-        bf16_to_f32_cuda(W.bf16(), W_f32.f32(), W.numel());
+        // Mixed: F32 input, BF16 weight — convert x (smaller) to BF16 and use BF16 GEMM
+        // BF16 tensor cores are 2x faster; accumulation stays in F32 via CUBLAS_COMPUTE_32F
+        Tensor x_bf16 = Tensor::alloc_shape(x.ndim, x.shape, DType::BF16, true);
+        f32_to_bf16_cuda(x.f32(), x_bf16.bf16(), x.numel());
         CHECK_CUBLAS(cublasGemmEx(g_cublas,
             CUBLAS_OP_T, CUBLAS_OP_N,
             N, M, K,
             &alpha,
-            W_f32.data, CUDA_R_32F, K,
-            x.data, CUDA_R_32F, K,
+            W.data, CUDA_R_16BF, K,
+            x_bf16.data, CUDA_R_16BF, K,
             &beta,
             output.data, CUDA_R_32F, N,
             CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
     } else if (x.dtype == DType::F32 && W.dtype == DType::FP16) {
-        // Mixed: F32 input, FP16 weight — convert W to F32 for full precision
-        Tensor W_f32 = Tensor::alloc_shape(W.ndim, W.shape, DType::F32, true);
-        fp16_to_f32_cuda(W.fp16(), W_f32.f32(), W.numel());
+        // Mixed: F32 input, FP16 weight — convert x (smaller) to FP16 and use FP16 GEMM
+        Tensor x_fp16 = Tensor::alloc_shape(x.ndim, x.shape, DType::FP16, true);
+        f32_to_fp16_cuda(x.f32(), x_fp16.fp16(), x.numel());
         CHECK_CUBLAS(cublasGemmEx(g_cublas,
             CUBLAS_OP_T, CUBLAS_OP_N,
             N, M, K,
             &alpha,
-            W_f32.data, CUDA_R_32F, K,
-            x.data, CUDA_R_32F, K,
+            W.data, CUDA_R_16F, K,
+            x_fp16.data, CUDA_R_16F, K,
             &beta,
             output.data, CUDA_R_32F, N,
             CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
