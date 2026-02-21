@@ -13,6 +13,8 @@
 #include <cstring>
 #include <string>
 #include <chrono>
+#include <algorithm>
+#include <cmath>
 
 // Precompute DCT position features for NeRF decoder
 // patch_size=16, max_freqs=8
@@ -64,6 +66,8 @@ static std::vector<float> compute_dct_features(int patch_size, int max_freqs) {
 
 struct Args {
     std::string prompt = "a photo of a cat";
+    std::string negative_prompt = "";
+    float cfg_scale = 1.0f;
     int width = 512;
     int height = 512;
     int steps = 20;
@@ -81,6 +85,10 @@ static Args parse_args(int argc, char** argv) {
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-p") == 0 || strcmp(argv[i], "--prompt") == 0) {
             args.prompt = argv[++i];
+        } else if (strcmp(argv[i], "-n") == 0 || strcmp(argv[i], "--negative-prompt") == 0) {
+            args.negative_prompt = argv[++i];
+        } else if (strcmp(argv[i], "--cfg-scale") == 0) {
+            args.cfg_scale = atof(argv[++i]);
         } else if (strcmp(argv[i], "-W") == 0 || strcmp(argv[i], "--width") == 0) {
             args.width = atoi(argv[++i]);
         } else if (strcmp(argv[i], "-H") == 0 || strcmp(argv[i], "--height") == 0) {
@@ -107,6 +115,8 @@ static Args parse_args(int argc, char** argv) {
         } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
             printf("Usage: chroma-radiance [options]\n");
             printf("  -p, --prompt TEXT     Prompt text (default: 'a photo of a cat')\n");
+            printf("  -n, --negative-prompt TEXT  Negative prompt for CFG uncond pass (default: '')\n");
+            printf("  --cfg-scale F         Classifier-free guidance scale (default: 1.0)\n");
             printf("  -W, --width N         Image width (default: 512)\n");
             printf("  -H, --height N        Image height (default: 512)\n");
             printf("  --steps N             Number of sampling steps (default: 20)\n");
@@ -139,8 +149,19 @@ int main(int argc, char** argv) {
 
     printf("=== Chroma Radiance Standalone (cuBLAS) ===\n");
     printf("Prompt: %s\n", args.prompt.c_str());
+    printf("Negative prompt: %s\n", args.negative_prompt.c_str());
+    printf("CFG scale: %.3f\n", args.cfg_scale);
     printf("Size: %dx%d, Steps: %d, Seed: %llu, RNG: %s\n", args.width, args.height, args.steps, args.seed,
            args.rng_mode == 0 ? "pytorch" : "sdcpp");
+
+    bool use_cfg = std::fabs(args.cfg_scale - 1.0f) > 1e-6f;
+    if (args.cfg_scale <= 0.0f) {
+        fprintf(stderr, "Error: --cfg-scale must be > 0\n");
+        return 1;
+    }
+    if (!use_cfg && !args.negative_prompt.empty()) {
+        printf("Note: --negative-prompt is ignored when --cfg-scale is 1.0\n");
+    }
 
     // Validate dimensions
     if (args.width % 16 != 0 || args.height % 16 != 0) {
@@ -168,16 +189,37 @@ int main(int argc, char** argv) {
     T5Tokenizer tokenizer;
     tokenizer.load(args.tokenizer_path);
 
-    // Tokenize
+    int context_len = 512;
+
+    // Positive prompt tokenize
     std::vector<int> tokens = tokenizer.encode(args.prompt);
-    int n_real_tokens = (int)tokens.size();  // before padding
-    printf("Tokenized: %d tokens:", n_real_tokens);
-    for (size_t i = 0; i < tokens.size(); i++) printf(" %d", tokens[i]);
+    int n_real_tokens = std::min((int)tokens.size(), context_len);  // before padding/truncation
+    if ((int)tokens.size() > context_len) {
+        tokens.resize(context_len);
+    }
+    printf("Tokenized (+): %d tokens:", n_real_tokens);
+    for (int i = 0; i < std::min<int>((int)tokens.size(), 16); i++) printf(" %d", tokens[i]);
+    if ((int)tokens.size() > 16) printf(" ...");
     printf("\n");
 
-    // Pad to 512
-    int context_len = 512;
+    // Pad to context length
     tokenizer.pad(tokens, context_len);
+
+    // Negative/unconditioned tokenize (used only when CFG is enabled)
+    std::vector<int> tokens_uncond;
+    int n_real_tokens_uncond = 0;
+    if (use_cfg) {
+        tokens_uncond = tokenizer.encode(args.negative_prompt);
+        n_real_tokens_uncond = std::min((int)tokens_uncond.size(), context_len);
+        if ((int)tokens_uncond.size() > context_len) {
+            tokens_uncond.resize(context_len);
+        }
+        printf("Tokenized (-): %d tokens:", n_real_tokens_uncond);
+        for (int i = 0; i < std::min<int>((int)tokens_uncond.size(), 16); i++) printf(" %d", tokens_uncond[i]);
+        if ((int)tokens_uncond.size() > 16) printf(" ...");
+        printf("\n");
+        tokenizer.pad(tokens_uncond, context_len);
+    }
 
     // Load T5 model
     SafetensorsFile t5_file;
@@ -192,11 +234,18 @@ int main(int argc, char** argv) {
     // Run T5 encoder
     auto t1 = std::chrono::high_resolution_clock::now();
     Tensor context = t5.forward(tokens);  // No T5 attention mask (matches ComfyUI)
+    Tensor context_uncond;
+    if (use_cfg) {
+        context_uncond = t5.forward(tokens_uncond);  // unconditioned/negative context
+    }
     CHECK_CUDA(cudaDeviceSynchronize());
     auto t2 = std::chrono::high_resolution_clock::now();
     printf("T5 encoding done in %.1f ms\n",
            std::chrono::duration<float, std::milli>(t2 - t1).count());
     context.print_info("T5 output");
+    if (use_cfg) {
+        context_uncond.print_info("T5 output (uncond)");
+    }
 
     // Print T5 output checksum and dump to file
     {
@@ -210,9 +259,16 @@ int main(int argc, char** argv) {
         }
         printf("T5 output checksum: %.6f, mean_abs: %.12f\n", sum, abs_sum / n);
 
-        // Dump T5 context to binary file for comparison
+        // Dump conditioned T5 context to binary file for comparison
         FILE* f = fopen("/tmp/t5_context_f32.bin", "wb");
         if (f) { fwrite(v.data(), sizeof(float), n, f); fclose(f); printf("Dumped T5 context to /tmp/t5_context_f32.bin\n"); }
+    }
+    if (use_cfg) {
+        int64_t n = context_uncond.numel();
+        std::vector<float> v(n);
+        CHECK_CUDA(cudaMemcpy(v.data(), context_uncond.f32(), n * sizeof(float), cudaMemcpyDeviceToHost));
+        FILE* f = fopen("/tmp/t5_context_uncond_f32.bin", "wb");
+        if (f) { fwrite(v.data(), sizeof(float), n, f); fclose(f); printf("Dumped uncond T5 context to /tmp/t5_context_uncond_f32.bin\n"); }
     }
 
     // Free T5 weights and close T5 file
@@ -257,8 +313,6 @@ int main(int argc, char** argv) {
     int total_tokens = context_len + img_tokens;
     int pe_feat = 64 * 4; // d_head/2 * 4
 
-    printf("Image tokens: %d, Total tokens: %d\n", img_tokens, total_tokens);
-
     // Upload PE to GPU
     Tensor pe = Tensor::alloc({(int64_t)total_tokens, (int64_t)pe_feat}, DType::F32, true);
     CHECK_CUDA(cudaMemcpy(pe.data, pe_vec.data(), pe_vec.size() * sizeof(float),
@@ -275,20 +329,29 @@ int main(int argc, char** argv) {
     // Layout: [context_len + img_tokens] = [txt_real: 0, txt_pad+1: 0, txt_pad_rest: -inf, img: 0]
     // mask_pad=1: allow 1 extra padding token after real text (matches sd.cpp chroma_t5_mask_pad=1)
     int mask_pad = 1;
-    std::vector<float> attn_mask_vec(total_tokens, 0.0f);
-    if (!args.no_mask) {
-        for (int i = n_real_tokens + mask_pad; i < context_len; i++) {
-            attn_mask_vec[i] = -HUGE_VALF;
+    auto make_attn_mask = [&](int real_tokens, const char* label) -> Tensor {
+        std::vector<float> attn_mask_vec(total_tokens, 0.0f);
+        if (!args.no_mask) {
+            int start_block = std::min(real_tokens + mask_pad, context_len);
+            for (int i = start_block; i < context_len; i++) {
+                attn_mask_vec[i] = -HUGE_VALF;
+            }
+            printf("Attention mask (%s): %d real tokens + %d mask_pad, %d blocked, %d image tokens\n",
+                   label, real_tokens, mask_pad, context_len - start_block, img_tokens);
+        } else {
+            printf("Attention mask (%s): DISABLED (--no-mask)\n", label);
         }
-        printf("Attention mask: %d real tokens + %d mask_pad, %d blocked, %d image tokens\n",
-               n_real_tokens, mask_pad, context_len - n_real_tokens - mask_pad, img_tokens);
-    } else {
-        printf("Attention mask: DISABLED (--no-mask)\n");
-    }
+        Tensor attn_mask = Tensor::alloc({(int64_t)total_tokens}, DType::F32, true);
+        CHECK_CUDA(cudaMemcpy(attn_mask.data, attn_mask_vec.data(),
+                              total_tokens * sizeof(float), cudaMemcpyHostToDevice));
+        return attn_mask;
+    };
 
-    Tensor attn_mask = Tensor::alloc({(int64_t)total_tokens}, DType::F32, true);
-    CHECK_CUDA(cudaMemcpy(attn_mask.data, attn_mask_vec.data(),
-                          total_tokens * sizeof(float), cudaMemcpyHostToDevice));
+    Tensor attn_mask = make_attn_mask(n_real_tokens, "+");
+    Tensor attn_mask_uncond;
+    if (use_cfg) {
+        attn_mask_uncond = make_attn_mask(n_real_tokens_uncond, "-");
+    }
 
     // ========================================
     // Phase 4: Sampling
@@ -317,26 +380,48 @@ int main(int argc, char** argv) {
         float sigma = sampler.get_sigma(step);
         auto step_start = std::chrono::high_resolution_clock::now();
 
-        // Forward pass
-        Tensor velocity = chroma.forward(x, context, sigma, pe, dct_features, attn_mask.f32());
+        if (use_cfg) {
+            // Two-pass CFG: guided = uncond + cfg * (cond - uncond)
+            Tensor velocity_cond = chroma.forward(x, context, sigma, pe, dct_features, attn_mask.f32());
+            Tensor velocity_uncond = chroma.forward(x, context_uncond, sigma, pe, dct_features, attn_mask_uncond.f32());
+            int64_t n = velocity_cond.numel();
+            add_scaled_cuda(velocity_cond.f32(), velocity_uncond.f32(), velocity_cond.f32(), -1.0f, n);
+            scale_cuda(velocity_cond.f32(), args.cfg_scale, n);
+            add_cuda(velocity_cond.f32(), velocity_uncond.f32(), velocity_cond.f32(), n);
 
-        // Diagnostic: print velocity stats for step 0
-        if (step == 0) {
-            int64_t n = velocity.numel();
-            std::vector<float> v(n);
-            CHECK_CUDA(cudaMemcpy(v.data(), velocity.f32(), n * sizeof(float), cudaMemcpyDeviceToHost));
-            double sum = 0, abs_sum = 0;
-            for (int64_t i = 0; i < n; i++) { sum += v[i]; abs_sum += fabs(v[i]); }
-            printf("[DIAG] velocity: sum=%.6f, mean=%.6f, mean_abs=%.6f, first10=[%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f]\n",
-                   sum, sum/n, abs_sum/n, v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7], v[8], v[9]);
+            // Diagnostic: print guided velocity stats for step 0
+            if (step == 0) {
+                std::vector<float> v(n);
+                CHECK_CUDA(cudaMemcpy(v.data(), velocity_cond.f32(), n * sizeof(float), cudaMemcpyDeviceToHost));
+                double sum = 0, abs_sum = 0;
+                for (int64_t i = 0; i < n; i++) { sum += v[i]; abs_sum += fabs(v[i]); }
+                printf("[DIAG] velocity (CFG): sum=%.6f, mean=%.6f, mean_abs=%.6f, first10=[%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f]\n",
+                       sum, sum/n, abs_sum/n, v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7], v[8], v[9]);
 
-            // Dump velocity to file
-            FILE* f = fopen("/tmp/velocity_f32.bin", "wb");
-            if (f) { fwrite(v.data(), sizeof(float), n, f); fclose(f); printf("Dumped velocity to /tmp/velocity_f32.bin\n"); }
+                FILE* f = fopen("/tmp/velocity_f32.bin", "wb");
+                if (f) { fwrite(v.data(), sizeof(float), n, f); fclose(f); printf("Dumped velocity to /tmp/velocity_f32.bin\n"); }
+            }
+
+            sampler.step(x, velocity_cond, step);
+        } else {
+            // Single conditioned pass
+            Tensor velocity = chroma.forward(x, context, sigma, pe, dct_features, attn_mask.f32());
+
+            if (step == 0) {
+                int64_t n = velocity.numel();
+                std::vector<float> v(n);
+                CHECK_CUDA(cudaMemcpy(v.data(), velocity.f32(), n * sizeof(float), cudaMemcpyDeviceToHost));
+                double sum = 0, abs_sum = 0;
+                for (int64_t i = 0; i < n; i++) { sum += v[i]; abs_sum += fabs(v[i]); }
+                printf("[DIAG] velocity: sum=%.6f, mean=%.6f, mean_abs=%.6f, first10=[%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f]\n",
+                       sum, sum/n, abs_sum/n, v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7], v[8], v[9]);
+
+                FILE* f = fopen("/tmp/velocity_f32.bin", "wb");
+                if (f) { fwrite(v.data(), sizeof(float), n, f); fclose(f); printf("Dumped velocity to /tmp/velocity_f32.bin\n"); }
+            }
+
+            sampler.step(x, velocity, step);
         }
-
-        // Euler step
-        sampler.step(x, velocity, step);
 
         CHECK_CUDA(cudaDeviceSynchronize());
         auto step_end = std::chrono::high_resolution_clock::now();
