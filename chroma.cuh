@@ -99,6 +99,16 @@ struct ChromaApproximator {
         }
     }
 
+    void disown() {
+        in_proj_w.owns_data = false; in_proj_b.owns_data = false;
+        out_proj_w.owns_data = false; out_proj_b.owns_data = false;
+        for (int i = 0; i < 5; i++) {
+            layers[i].norm_scale.owns_data = false;
+            layers[i].in_w.owns_data = false; layers[i].in_b.owns_data = false;
+            layers[i].out_w.owns_data = false; layers[i].out_b.owns_data = false;
+        }
+    }
+
     // input: [344, 64] → output: [344, 3072]
     Tensor forward(const Tensor& x_in) {
         int64_t N = x_in.shape[0]; // 344
@@ -128,7 +138,7 @@ struct ChromaApproximator {
 };
 
 // ============================================================================
-// Double-stream block weights (loaded on-demand)
+// Double-stream block weights
 // ============================================================================
 struct DoubleStreamBlockWeights {
     // Image stream
@@ -144,6 +154,19 @@ struct DoubleStreamBlockWeights {
     Tensor txt_proj_w, txt_proj_b;  // [3072, 3072], [3072]
     Tensor txt_mlp_0_w, txt_mlp_0_b;  // [12288, 3072], [12288]
     Tensor txt_mlp_2_w, txt_mlp_2_b;  // [3072, 12288], [3072]
+
+    void disown() {
+        img_qkv_w.owns_data = false; img_qkv_b.owns_data = false;
+        img_q_norm.owns_data = false; img_k_norm.owns_data = false;
+        img_proj_w.owns_data = false; img_proj_b.owns_data = false;
+        img_mlp_0_w.owns_data = false; img_mlp_0_b.owns_data = false;
+        img_mlp_2_w.owns_data = false; img_mlp_2_b.owns_data = false;
+        txt_qkv_w.owns_data = false; txt_qkv_b.owns_data = false;
+        txt_q_norm.owns_data = false; txt_k_norm.owns_data = false;
+        txt_proj_w.owns_data = false; txt_proj_b.owns_data = false;
+        txt_mlp_0_w.owns_data = false; txt_mlp_0_b.owns_data = false;
+        txt_mlp_2_w.owns_data = false; txt_mlp_2_b.owns_data = false;
+    }
 
     static DoubleStreamBlockWeights load(const SafetensorsFile& sf, int idx) {
         DoubleStreamBlockWeights w;
@@ -176,12 +199,18 @@ struct DoubleStreamBlockWeights {
 };
 
 // ============================================================================
-// Single-stream block weights (loaded on-demand)
+// Single-stream block weights
 // ============================================================================
 struct SingleStreamBlockWeights {
     Tensor linear1_w, linear1_b;   // [21504, 3072], [21504]
     Tensor linear2_w, linear2_b;   // [3072, 15360], [3072]
     Tensor q_norm, k_norm;         // [128]
+
+    void disown() {
+        linear1_w.owns_data = false; linear1_b.owns_data = false;
+        linear2_w.owns_data = false; linear2_b.owns_data = false;
+        q_norm.owns_data = false; k_norm.owns_data = false;
+    }
 
     static SingleStreamBlockWeights load(const SafetensorsFile& sf, int idx) {
         SingleStreamBlockWeights w;
@@ -199,11 +228,16 @@ struct SingleStreamBlockWeights {
 };
 
 // ============================================================================
-// NeRF GLU block weights (loaded on-demand)
+// NeRF GLU block weights
 // ============================================================================
 struct NerfGLUBlockWeights {
     Tensor param_gen_w, param_gen_b;  // [49152, 3072], [49152]
     Tensor norm_scale;                // [64]
+
+    void disown() {
+        param_gen_w.owns_data = false; param_gen_b.owns_data = false;
+        norm_scale.owns_data = false;
+    }
 
     static NerfGLUBlockWeights load(const SafetensorsFile& sf, int idx) {
         NerfGLUBlockWeights w;
@@ -225,7 +259,7 @@ struct NerfSmallWeights {
 };
 
 // ============================================================================
-// Chroma Radiance Model (weight-streaming)
+// Chroma Radiance Model (all weights pre-loaded on GPU)
 // ============================================================================
 struct ChromaRadiance {
     static constexpr int hidden_size = 3072;
@@ -241,20 +275,38 @@ struct ChromaRadiance {
     static constexpr int nerf_max_freqs = 8;
     static constexpr int mod_index_length = 344;
 
+    // GPU arena: single allocation for all weights (declared first → destroyed last)
+    GPUArena weight_arena;
+
     // Small always-resident weights
     Tensor img_in_patch_w, img_in_patch_b;  // Conv2d(3→3072, 16×16)
     Tensor txt_in_w, txt_in_b;              // Linear(4096→3072)
     NerfSmallWeights nerf_small;
 
-    // ChromaApproximator (loaded once per step, freed after modulation)
+    // ChromaApproximator
     ChromaApproximator approx;
 
-    // SafetensorsFile reference for on-demand weight loading
-    const SafetensorsFile* sf_ptr = nullptr;
+    // Pre-loaded block weights (all resident on GPU via arena)
+    std::vector<DoubleStreamBlockWeights> double_block_weights;  // [19]
+    std::vector<SingleStreamBlockWeights> single_block_weights;  // [38]
+    std::vector<NerfGLUBlockWeights> nerf_block_weights;         // [4]
 
     void load(const SafetensorsFile& sf) {
-        printf("Loading Chroma Radiance model (weight-streaming mode)...\n");
-        sf_ptr = &sf;
+        printf("Loading Chroma Radiance model (pre-loading all weights to GPU)...\n");
+
+        // Calculate arena size: sum of all tensor file sizes + alignment padding
+        // Weights are BF16 (loaded native), biases/norms are F32 (loaded as-is)
+        size_t arena_size = 0;
+        for (auto& [name, info] : sf.tensors)
+            arena_size += (info.nbytes + 255) & ~(size_t)255;
+        arena_size += 16 * 1024 * 1024;  // 16 MB safety margin
+
+        printf("  Allocating %.2f GB GPU arena...\n", arena_size / 1e9);
+        if (!weight_arena.init(arena_size)) {
+            fprintf(stderr, "Failed to allocate GPU weight arena (%.2f GB)\n", arena_size / 1e9);
+            exit(1);
+        }
+        gpu_pool().arena = &weight_arena;
 
         // Small resident weights
         img_in_patch_w = sf.load_tensor_native("img_in_patch.weight");
@@ -262,19 +314,54 @@ struct ChromaRadiance {
         txt_in_w = sf.load_tensor_native("txt_in.weight");
         txt_in_b = sf.load_tensor("txt_in.bias", DType::F32);
 
-        // NeRF small weights (tiny, always resident)
+        // NeRF small weights
         nerf_small.embedder_w = sf.load_tensor_native("nerf_image_embedder.embedder.0.weight");
         nerf_small.embedder_b = sf.load_tensor("nerf_image_embedder.embedder.0.bias", DType::F32);
         nerf_small.final_norm_scale = sf.load_tensor("nerf_final_layer_conv.norm.scale", DType::F32);
         nerf_small.final_conv_w = sf.load_tensor("nerf_final_layer_conv.conv.weight", DType::F32);
         nerf_small.final_conv_b = sf.load_tensor("nerf_final_layer_conv.conv.bias", DType::F32);
 
-        // ChromaApproximator (loaded once, used every step for modulation)
+        // ChromaApproximator
         approx.load(sf);
 
-        printf("Chroma Radiance model loaded (resident: ~%.0f MB, blocks streamed on-demand).\n",
-               (img_in_patch_w.nbytes() + txt_in_w.nbytes() +
-                nerf_small.embedder_w.nbytes() + nerf_small.final_conv_w.nbytes()) / 1e6);
+        // Pre-load all block weights
+        double_block_weights.reserve(depth);
+        for (int i = 0; i < depth; i++) {
+            double_block_weights.push_back(DoubleStreamBlockWeights::load(sf, i));
+            printf("  Loaded double_block %d/%d\r", i + 1, depth);
+            fflush(stdout);
+        }
+        printf("  Loaded %d double-stream blocks                \n", depth);
+
+        single_block_weights.reserve(depth_single);
+        for (int i = 0; i < depth_single; i++) {
+            single_block_weights.push_back(SingleStreamBlockWeights::load(sf, i));
+            printf("  Loaded single_block %d/%d\r", i + 1, depth_single);
+            fflush(stdout);
+        }
+        printf("  Loaded %d single-stream blocks                \n", depth_single);
+
+        nerf_block_weights.reserve(nerf_depth);
+        for (int i = 0; i < nerf_depth; i++)
+            nerf_block_weights.push_back(NerfGLUBlockWeights::load(sf, i));
+        printf("  Loaded %d NeRF GLU blocks\n", nerf_depth);
+
+        // Deactivate arena — all further allocations go through normal pool/cudaMalloc
+        gpu_pool().arena = nullptr;
+
+        // Disown all weight tensors (arena owns the memory, freed all at once)
+        img_in_patch_w.owns_data = false; img_in_patch_b.owns_data = false;
+        txt_in_w.owns_data = false; txt_in_b.owns_data = false;
+        nerf_small.embedder_w.owns_data = false; nerf_small.embedder_b.owns_data = false;
+        nerf_small.final_norm_scale.owns_data = false;
+        nerf_small.final_conv_w.owns_data = false; nerf_small.final_conv_b.owns_data = false;
+        approx.disown();
+        for (auto& w : double_block_weights) w.disown();
+        for (auto& w : single_block_weights) w.disown();
+        for (auto& w : nerf_block_weights) w.disown();
+
+        printf("Chroma Radiance model loaded: %.2f GB arena (%.2f GB used).\n",
+               weight_arena.capacity / 1e9, weight_arena.used / 1e9);
     }
 
     // ======================================================================
@@ -329,14 +416,13 @@ struct ChromaRadiance {
     }
 
     // ======================================================================
-    // Double-stream block forward (weights loaded on-demand)
+    // Double-stream block forward
     // ======================================================================
     void double_block_forward(int block_idx,
                                Tensor& img, Tensor& txt,
                                const Tensor& mod, const Tensor& pe,
                                const float* attn_mask = nullptr) {
-        // Load weights for this block
-        DoubleStreamBlockWeights w = DoubleStreamBlockWeights::load(*sf_ptr, block_idx);
+        const auto& w = double_block_weights[block_idx];
 
         int64_t img_tokens = img.shape[0];
         int64_t txt_tokens = txt.shape[0];
@@ -450,18 +536,15 @@ struct ChromaRadiance {
         Tensor txt_mlp_out = linear_forward(txt_mlp_h, w.txt_mlp_2_w, &w.txt_mlp_2_b);
         gated_residual_cuda(txt.f32(), txt_mlp_out.f32(), txt_gate2,
                             txt.f32(), txt_tokens, hidden_size);
-
-        // w goes out of scope here → all block weights freed by destructors
     }
 
     // ======================================================================
-    // Single-stream block forward (weights loaded on-demand)
+    // Single-stream block forward
     // ======================================================================
     void single_block_forward(int block_idx, Tensor& x,
                                const Tensor& mod, const Tensor& pe,
                                const float* attn_mask = nullptr) {
-        // Load weights for this block
-        SingleStreamBlockWeights w = SingleStreamBlockWeights::load(*sf_ptr, block_idx);
+        const auto& w = single_block_weights[block_idx];
 
         int64_t L = x.shape[0];
 
@@ -515,8 +598,6 @@ struct ChromaRadiance {
 
         // Gated residual
         gated_residual_cuda(x.f32(), output.f32(), gate, x.f32(), L, hidden_size);
-
-        // w goes out of scope → block weights freed
     }
 
     // ======================================================================
@@ -576,13 +657,13 @@ struct ChromaRadiance {
         // 4. Get conditioning
         Tensor nerf_hidden_t = transformer_out.reshape({(int64_t)num_patches, (int64_t)hidden_size});
 
-        // 5. NerfGLUBlocks (streamed on-demand)
+        // 5. NerfGLUBlocks
         if (fwd_call_count <= 1) {
             print_tensor_stats("nerf_embedder_out", img_dct.f32(), img_dct.numel());
             print_tensor_stats("nerf_conditioning", nerf_hidden_t.f32(), nerf_hidden_t.numel());
         }
         for (int i = 0; i < nerf_depth; i++) {
-            NerfGLUBlockWeights bw = NerfGLUBlockWeights::load(*sf_ptr, i);
+            const auto& bw = nerf_block_weights[i];
             nerf_glu_block(img_dct_3d, nerf_hidden_t, bw);
             if (fwd_call_count <= 1) {
                 char buf[64];
@@ -830,7 +911,7 @@ struct ChromaRadiance {
 
         fwd_call_count++;
 
-        // 4. Double-stream blocks (weights streamed)
+        // 4. Double-stream blocks
         for (int i = 0; i < depth; i++) {
             double_block_forward(i, img, txt, mod, pe, attn_mask);
             if (diag && i == 0) {
@@ -845,7 +926,7 @@ struct ChromaRadiance {
         concat_first_dim_cuda(txt.f32(), img.f32(), combined.f32(),
                               txt_tokens, img_tokens, hidden_size);
 
-        // 6. Single-stream blocks (weights streamed)
+        // 6. Single-stream blocks
         for (int i = 0; i < depth_single; i++) {
             single_block_forward(i, combined, mod, pe, attn_mask);
         }
@@ -861,7 +942,7 @@ struct ChromaRadiance {
             print_tensor_stats("transformer_out (img_out)", img_out.f32(), img_out.numel());
         }
 
-        // 8. NeRF decode (NeRF block weights streamed)
+        // 8. NeRF decode
         Tensor output = nerf_decode(img_out, x, dct_features, H, W);
 
         if (diag) {

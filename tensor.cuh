@@ -20,11 +20,56 @@
 } while(0)
 
 // ============================================================================
+// GPU Arena: single large cudaMalloc with bump allocation (like ggml_context).
+// Eliminates per-tensor cudaMalloc overhead and memory fragmentation.
+// ============================================================================
+struct GPUArena {
+    void* base = nullptr;
+    size_t capacity = 0;
+    size_t used = 0;
+
+    GPUArena() = default;
+    GPUArena(const GPUArena&) = delete;
+    GPUArena& operator=(const GPUArena&) = delete;
+
+    bool init(size_t bytes) {
+        if (base) { cudaFree(base); base = nullptr; }
+        cudaError_t err = cudaMalloc(&base, bytes);
+        if (err != cudaSuccess) {
+            fprintf(stderr, "GPUArena: failed to allocate %.2f GB\n", bytes / 1e9);
+            base = nullptr;
+            return false;
+        }
+        capacity = bytes;
+        used = 0;
+        return true;
+    }
+
+    void* alloc(size_t bytes) {
+        bytes = (bytes + 255) & ~(size_t)255;
+        if (used + bytes > capacity) return nullptr;
+        void* ptr = (char*)base + used;
+        used += bytes;
+        return ptr;
+    }
+
+    bool contains(const void* ptr) const {
+        return base && ptr >= base && ptr < (char*)base + capacity;
+    }
+
+    void reset() { used = 0; }
+
+    ~GPUArena() { if (base) cudaFree(base); }
+};
+
+// ============================================================================
 // GPU Memory Pool: eliminates cudaMalloc/cudaFree overhead by reusing buffers.
 // Uses a size-bucketed free list. Sizes are rounded up to 256-byte alignment.
+// When an arena is active, allocations come from the arena instead.
 // ============================================================================
 struct GPUMemPool {
     std::unordered_map<size_t, std::vector<void*>> free_lists;
+    GPUArena* arena = nullptr;
 
     void* alloc(size_t bytes) {
         bytes = (bytes + 255) & ~(size_t)255;
@@ -34,6 +79,11 @@ struct GPUMemPool {
             it->second.pop_back();
             return ptr;
         }
+        if (arena) {
+            void* ptr = arena->alloc(bytes);
+            if (ptr) return ptr;
+            // Arena full — fall through to cudaMalloc
+        }
         void* ptr = nullptr;
         CHECK_CUDA(cudaMalloc(&ptr, bytes));
         return ptr;
@@ -41,6 +91,7 @@ struct GPUMemPool {
 
     void free(void* ptr, size_t bytes) {
         if (!ptr) return;
+        if (arena && arena->contains(ptr)) return;  // arena frees all at once
         bytes = (bytes + 255) & ~(size_t)255;
         free_lists[bytes].push_back(ptr);
     }

@@ -274,8 +274,9 @@ int main(int argc, char** argv) {
         }
     }
 
-    // Free T5 weights and close T5 file
+    // Free T5 weights, release GPU pool, and close T5 file
     t5.free_weights();
+    gpu_pool().release_all();  // Return pooled T5 buffers to CUDA before loading Chroma
     t5_file.~SafetensorsFile();  // Release mmap
     new (&t5_file) SafetensorsFile();  // Reset to empty state
 
@@ -300,6 +301,10 @@ int main(int argc, char** argv) {
     ChromaRadiance chroma;
     chroma.debug_diag = args.debug;
     chroma.load(chroma_file);
+
+    // Release chroma mmap — all weights are now on GPU
+    chroma_file.~SafetensorsFile();
+    new (&chroma_file) SafetensorsFile();
 
     // ========================================
     // Phase 3: Precompute
