@@ -72,7 +72,7 @@ struct Args {
     int height = 512;
     int steps = 20;
     unsigned long long seed = 42;
-    std::string output = "output.ppm";
+    std::string output = "output.png";
     std::string model_path = "";
     std::string t5_path = "";
     std::string tokenizer_path = "";
@@ -124,7 +124,7 @@ static Args parse_args(int argc, char** argv) {
             printf("  -H, --height N        Image height (default: 512)\n");
             printf("  --steps N             Number of sampling steps (default: 20)\n");
             printf("  --seed N              Random seed (default: 42)\n");
-            printf("  -o, --output PATH     Output image path (default: output.ppm)\n");
+            printf("  -o, --output PATH     Output image path (default: output.png)\n");
             printf("  -m, --model PATH      Chroma model path (default: auto-detect)\n");
             printf("  --t5 PATH             T5 model path (default: auto-detect)\n");
             printf("  --tokenizer PATH      T5 tokenizer JSON path (default: auto-detect)\n");
@@ -460,8 +460,8 @@ int main(int argc, char** argv) {
         print_image_stats(x);
     }
 
-    // save_ppm clamps to [0, 1] internally
-    save_ppm(x, args.output.c_str());
+    // save_image dispatches to PNG or PPM based on file extension
+    save_image(x, args.output.c_str());
 
     auto t5_end = std::chrono::high_resolution_clock::now();
     printf("\nTotal time: %.1f s\n",
