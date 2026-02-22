@@ -227,6 +227,7 @@ private:
                 if (dt_str == "F32") info.dtype = DType::F32;
                 else if (dt_str == "F16") info.dtype = DType::FP16;
                 else if (dt_str == "BF16") info.dtype = DType::BF16;
+                else if (dt_str == "I8") info.dtype = DType::INT8;
                 else {
                     skip_ws();
                     if (json[pos] == ',') pos++;

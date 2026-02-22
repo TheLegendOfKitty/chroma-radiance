@@ -2,6 +2,7 @@
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
+#include <mma.h>
 #include <cmath>
 #include <cfloat>
 
@@ -17,6 +18,23 @@ __global__ void bf16_to_f32_kernel(const __nv_bfloat16* src, float* dst, int64_t
 __global__ void fp16_to_f32_kernel(const __half* src, float* dst, int64_t n) {
     int64_t i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) dst[i] = __half2float(src[i]);
+}
+
+__global__ void fp16_to_bf16_kernel(const __half* src, __nv_bfloat16* dst, int64_t n) {
+    int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    int64_t idx = i * 4;
+    if (idx + 3 < n) {
+        __half2 h0 = *reinterpret_cast<const __half2*>(src + idx);
+        __half2 h1 = *reinterpret_cast<const __half2*>(src + idx + 2);
+        float2 f0 = __half22float2(h0);
+        float2 f1 = __half22float2(h1);
+        *reinterpret_cast<__nv_bfloat162*>(dst + idx) = __floats2bfloat162_rn(f0.x, f0.y);
+        *reinterpret_cast<__nv_bfloat162*>(dst + idx + 2) = __floats2bfloat162_rn(f1.x, f1.y);
+    } else {
+        for (int64_t j = idx; j < n && j < idx + 4; j++) {
+            dst[j] = __float2bfloat16(__half2float(src[j]));
+        }
+    }
 }
 
 __global__ void f32_to_bf16_kernel(const float* src, __nv_bfloat16* dst, int64_t n) {
@@ -51,6 +69,13 @@ void fp16_to_f32_cuda(const __half* src, float* dst, int64_t n) {
     int threads = 256;
     int blocks = (n + threads - 1) / threads;
     fp16_to_f32_kernel<<<blocks, threads>>>(src, dst, n);
+}
+
+void fp16_to_bf16_cuda(const __half* src, __nv_bfloat16* dst, int64_t n) {
+    int threads = 256;
+    int64_t work_items = (n + 3) / 4;  // each thread handles 4 elements
+    int blocks = (work_items + threads - 1) / threads;
+    fp16_to_bf16_kernel<<<blocks, threads>>>(src, dst, n);
 }
 
 void f32_to_bf16_cuda(const float* src, __nv_bfloat16* dst, int64_t n) {
@@ -1257,3 +1282,487 @@ void broadcast_rows_cuda(const float* src, float* dst,
     int blocks = (int)((total + threads - 1) / threads);
     broadcast_rows_kernel<<<blocks, threads>>>(src, dst, batch, seq_feat);
 }
+
+// ============================================================================
+// INT8 Dequantization to BF16 with per-group scales
+// w: [N, K] INT8, scales: [N, num_groups] F32, out: [N, K] BF16
+// Each group of `group_size` elements along K shares one scale.
+// ============================================================================
+
+__device__ __forceinline__ float load_quant_scale_device(const void* scales, int scales_dtype, int64_t idx) {
+    if (scales_dtype == (int)DType::F32) {
+        return ((const float*)scales)[idx];
+    }
+    if (scales_dtype == (int)DType::FP16) {
+        return __half2float(((const __half*)scales)[idx]);
+    }
+    // Default/fallback to BF16 for compact scale storage.
+    return __bfloat162float(((const __nv_bfloat16*)scales)[idx]);
+}
+
+__global__ void dequant_int8_to_bf16_kernel(const int8_t* __restrict__ w,
+                                             const void* __restrict__ scales,
+                                             int scales_dtype,
+                                             __nv_bfloat16* __restrict__ out,
+                                             int64_t N, int64_t K,
+                                             int num_groups, int group_size) {
+    int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= N * K) return;
+    int64_t n = idx / K;
+    int64_t k = idx % K;
+    int g = (int)(k / group_size);
+    float s = load_quant_scale_device(scales, scales_dtype, n * num_groups + g);
+    out[idx] = __float2bfloat16((float)w[idx] * s);
+}
+
+void dequant_int8_to_bf16_cuda(const int8_t* src, const void* scales, DType scales_dtype,
+                                __nv_bfloat16* dst, int64_t N, int64_t K,
+                                int group_size) {
+    int num_groups = (int)((K + group_size - 1) / group_size);
+    int64_t total = N * K;
+    int threads = 256;
+    int blocks = (int)((total + threads - 1) / threads);
+    dequant_int8_to_bf16_kernel<<<blocks, threads>>>(src, scales, (int)scales_dtype,
+                                                     dst, N, K, num_groups, group_size);
+}
+
+// ============================================================================
+// Fused INT8 Dequant + BF16 WMMA GEMM
+// Y[M,N] = X[M,K] @ W[N,K]^T + bias[N]
+//
+// Optimizations:
+// - specialized paths for common group_size=128 and per-channel scale rows
+// - BK=32 / BK=64 variants (heuristic selection)
+// - full-tile kernel (no bounds checks) + edge fallback
+// - vectorized X (bf162/cp.async 16B) and W (uint4/16-wide) loads
+// - vectorized epilogue stores (float4) on interior tiles
+// - cp.async for X activations (Ampere+), overlapped with synchronous W loads
+// - scalar byte loads in edge tiles to handle K not divisible by 4
+// ============================================================================
+
+#define FUSED_BM 64
+#define FUSED_BN 64
+#define FUSED_PAD 8
+
+using namespace nvcuda;
+
+__device__ __forceinline__ void cp_async_copy16(void* smem_dst, const void* gmem_src) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
+    unsigned smem_addr = static_cast<unsigned>(__cvta_generic_to_shared(smem_dst));
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" :: "r"(smem_addr), "l"(gmem_src));
+#else
+    *reinterpret_cast<uint4*>(smem_dst) = *reinterpret_cast<const uint4*>(gmem_src);
+#endif
+}
+
+__device__ __forceinline__ void cp_async_commit_group() {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
+    asm volatile("cp.async.commit_group;\n" ::);
+#endif
+}
+
+__device__ __forceinline__ void cp_async_wait_all() {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
+    asm volatile("cp.async.wait_group 0;\n" ::);
+#endif
+}
+
+template<int BK, int GROUP_SIZE_CONST, bool FULL_TILE, bool USE_CP_ASYNC_X>
+__launch_bounds__(128, 5)
+__global__ void fused_dequant_gemm_kernel_t(
+    const __nv_bfloat16* __restrict__ X,     // [M, K] row-major BF16
+    const int8_t* __restrict__ W,            // [N, K] row-major INT8
+    const void* __restrict__ scales,         // [N, num_groups] F32/FP16/BF16
+    int scales_dtype,
+    const float* __restrict__ bias,          // [N] F32 or nullptr
+    float* __restrict__ Y,                   // [M, N] row-major F32
+    int M, int N, int K, int group_size,
+    int skip_full_n, int skip_full_m)
+{
+    static_assert(BK == 32 || BK == 64, "Unsupported BK");
+    static_assert((BK % 16) == 0, "BK must be multiple of 16");
+    static_assert((BK % 4) == 0, "BK must be multiple of 4");
+
+    constexpr int STRIDE = BK + FUSED_PAD;
+    constexpr int X_PAIR_COUNT = FUSED_BM * (BK / 2);
+    constexpr int W_VEC4_COUNT = FUSED_BN * (BK / 4);
+
+    if constexpr (!FULL_TILE) {
+        if (blockIdx.x < skip_full_n && blockIdx.y < skip_full_m) return;
+    }
+
+    const int block_n = blockIdx.x * FUSED_BN;
+    const int block_m = blockIdx.y * FUSED_BM;
+    const int tid = threadIdx.x;
+    const int warp_id = tid >> 5;
+    const int warp_m = warp_id >> 1;   // 0 or 1
+    const int warp_n = warp_id & 1;    // 0 or 1
+    const int num_groups = (K + group_size - 1) / group_size;
+
+    extern __shared__ char smem_raw[];
+    __nv_bfloat16* smem_base = reinterpret_cast<__nv_bfloat16*>(smem_raw);
+    __nv_bfloat16* smem_x = smem_base;
+    __nv_bfloat16* smem_w = smem_x + FUSED_BM * STRIDE;
+    float* smem_scales = reinterpret_cast<float*>(smem_w + FUSED_BN * STRIDE);
+
+    auto load_x_tile = [&](int k_start) {
+        __nv_bfloat16* sx = smem_x;
+        if constexpr (FULL_TILE && USE_CP_ASYNC_X) {
+            constexpr int X_CHUNK16_COUNT = FUSED_BM * (BK / 8);  // 16B per chunk = 8 bf16
+            #pragma unroll
+            for (int idx16 = tid; idx16 < X_CHUNK16_COUNT; idx16 += 128) {
+                int local_m = idx16 / (BK / 8);
+                int local_k = (idx16 % (BK / 8)) * 8;
+                __nv_bfloat16* dst = sx + local_m * STRIDE + local_k;
+                const int gm = block_m + local_m;
+                const int gk = k_start + local_k;
+                cp_async_copy16(dst, X + (int64_t)gm * K + gk);
+            }
+            // Note: commit moved to caller so X and W cp.async share one group
+        } else {
+            #pragma unroll
+            for (int idx2 = tid; idx2 < X_PAIR_COUNT; idx2 += 128) {
+                int local_m = idx2 / (BK / 2);
+                int local_k = (idx2 % (BK / 2)) * 2;
+                __nv_bfloat16* dst = sx + local_m * STRIDE + local_k;
+                const int gm = block_m + local_m;
+                const int gk = k_start + local_k;
+                if constexpr (FULL_TILE) {
+                    const __nv_bfloat162* src = reinterpret_cast<const __nv_bfloat162*>(
+                        X + (int64_t)gm * K + gk);
+                    *reinterpret_cast<__nv_bfloat162*>(dst) = *src;
+                } else {
+                    __nv_bfloat16 v0 = __float2bfloat16(0.0f);
+                    __nv_bfloat16 v1 = __float2bfloat16(0.0f);
+                    if (gm < M && gk < K) v0 = X[(int64_t)gm * K + gk];
+                    if (gm < M && gk + 1 < K) v1 = X[(int64_t)gm * K + gk + 1];
+                    dst[0] = v0;
+                    dst[1] = v1;
+                }
+            }
+        }
+    };
+
+    auto store_dequant4 = [](__nv_bfloat16* dst, float f0, float f1, float f2, float f3) {
+        *reinterpret_cast<__nv_bfloat162*>(dst + 0) = __floats2bfloat162_rn(f0, f1);
+        *reinterpret_cast<__nv_bfloat162*>(dst + 2) = __floats2bfloat162_rn(f2, f3);
+    };
+
+    auto load_w_tile = [&](int k_start) {
+        __nv_bfloat16* sw = smem_w;
+        if constexpr (FULL_TILE) {
+            // 16-wide vectorized: uint4 load (16 INT8 values), 4x fewer iterations
+            constexpr int W_VEC16_COUNT = FUSED_BN * (BK / 16);
+            #pragma unroll
+            for (int idx16 = tid; idx16 < W_VEC16_COUNT; idx16 += 128) {
+                int local_n = idx16 / (BK / 16);
+                int local_k = (idx16 % (BK / 16)) * 16;
+                __nv_bfloat16* dst = sw + local_n * STRIDE + local_k;
+                const int gn = block_n + local_n;
+                const int gk = k_start + local_k;
+
+                uint4 raw = *reinterpret_cast<const uint4*>(W + (int64_t)gn * K + gk);
+                const int8_t* q = reinterpret_cast<const int8_t*>(&raw);
+
+                if constexpr (GROUP_SIZE_CONST == 128 || GROUP_SIZE_CONST == -1) {
+                    float s = smem_scales[local_n];
+                    store_dequant4(dst + 0,  (float)q[0]*s,  (float)q[1]*s,  (float)q[2]*s,  (float)q[3]*s);
+                    store_dequant4(dst + 4,  (float)q[4]*s,  (float)q[5]*s,  (float)q[6]*s,  (float)q[7]*s);
+                    store_dequant4(dst + 8,  (float)q[8]*s,  (float)q[9]*s,  (float)q[10]*s, (float)q[11]*s);
+                    store_dequant4(dst + 12, (float)q[12]*s, (float)q[13]*s, (float)q[14]*s, (float)q[15]*s);
+                } else {
+                    int64_t scale_base = (int64_t)gn * num_groups;
+                    #pragma unroll
+                    for (int i = 0; i < 16; i += 4) {
+                        int gki = gk + i;
+                        float s0 = load_quant_scale_device(scales, scales_dtype, scale_base + gki / group_size);
+                        float s1 = load_quant_scale_device(scales, scales_dtype, scale_base + (gki+1) / group_size);
+                        float s2 = load_quant_scale_device(scales, scales_dtype, scale_base + (gki+2) / group_size);
+                        float s3 = load_quant_scale_device(scales, scales_dtype, scale_base + (gki+3) / group_size);
+                        store_dequant4(dst + i,
+                                       (float)q[i]*s0, (float)q[i+1]*s1,
+                                       (float)q[i+2]*s2, (float)q[i+3]*s3);
+                    }
+                }
+            }
+        } else {
+            #pragma unroll
+            for (int idx4 = tid; idx4 < W_VEC4_COUNT; idx4 += 128) {
+                int local_n = idx4 / (BK / 4);
+                int local_k = (idx4 % (BK / 4)) * 4;
+                __nv_bfloat16* dst = sw + local_n * STRIDE + local_k;
+                const int gn = block_n + local_n;
+                const int gk = k_start + local_k;
+                if (gn < N && gk + 3 < K) {
+                    // Scalar loads to avoid misaligned char4 when K % 4 != 0
+                    const int8_t* src = W + (int64_t)gn * K + gk;
+                    int8_t q0 = src[0], q1 = src[1], q2 = src[2], q3 = src[3];
+                    if constexpr (GROUP_SIZE_CONST == 128 || GROUP_SIZE_CONST == -1) {
+                        float s = smem_scales[local_n];
+                        store_dequant4(dst,
+                                       (float)q0 * s, (float)q1 * s,
+                                       (float)q2 * s, (float)q3 * s);
+                    } else {
+                        int64_t scale_base = (int64_t)gn * num_groups;
+                        float s0 = load_quant_scale_device(scales, scales_dtype, scale_base + (gk + 0) / group_size);
+                        float s1 = load_quant_scale_device(scales, scales_dtype, scale_base + (gk + 1) / group_size);
+                        float s2 = load_quant_scale_device(scales, scales_dtype, scale_base + (gk + 2) / group_size);
+                        float s3 = load_quant_scale_device(scales, scales_dtype, scale_base + (gk + 3) / group_size);
+                        store_dequant4(dst,
+                                       (float)q0 * s0, (float)q1 * s1,
+                                       (float)q2 * s2, (float)q3 * s3);
+                    }
+                } else {
+                    #pragma unroll
+                    for (int t = 0; t < 4; ++t) {
+                        int kk = gk + t;
+                        __nv_bfloat16 v = __float2bfloat16(0.0f);
+                        if (gn < N && kk < K) {
+                            int8_t q = W[(int64_t)gn * K + kk];
+                            float s;
+                            if constexpr (GROUP_SIZE_CONST == 128 || GROUP_SIZE_CONST == -1) {
+                                s = smem_scales[local_n];
+                            } else {
+                                s = load_quant_scale_device(scales, scales_dtype,
+                                                              (int64_t)gn * num_groups + kk / group_size);
+                            }
+                            v = __float2bfloat16((float)q * s);
+                        }
+                        dst[t] = v;
+                    }
+                }
+            }
+        }
+    };
+
+    // WMMA accumulators: each warp has 2x2 tiles of 16x16
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[2][2];
+    #pragma unroll
+    for (int i = 0; i < 2; i++)
+        #pragma unroll
+        for (int j = 0; j < 2; j++)
+            wmma::fill_fragment(acc[i][j], 0.0f);
+
+    auto mma_stage = [&]() {
+        __nv_bfloat16* sx = smem_x;
+        __nv_bfloat16* sw = smem_w;
+        #pragma unroll
+        for (int ki = 0; ki < BK; ki += 16) {
+            wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major> frag_a[2];
+            wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::col_major> frag_b[2];
+
+            #pragma unroll
+            for (int sm = 0; sm < 2; sm++) {
+                wmma::load_matrix_sync(
+                    frag_a[sm],
+                    &sx[(warp_m * 32 + sm * 16) * STRIDE + ki],
+                    STRIDE);
+            }
+            #pragma unroll
+            for (int sn = 0; sn < 2; sn++) {
+                wmma::load_matrix_sync(
+                    frag_b[sn],
+                    &sw[(warp_n * 32 + sn * 16) * STRIDE + ki],
+                    STRIDE);
+            }
+            #pragma unroll
+            for (int sm = 0; sm < 2; sm++)
+                #pragma unroll
+                for (int sn = 0; sn < 2; sn++)
+                    wmma::mma_sync(acc[sm][sn], frag_a[sm], frag_b[sn], acc[sm][sn]);
+        }
+    };
+
+    // Pre-load per-channel scales once (constant across all k iterations)
+    if constexpr (GROUP_SIZE_CONST == -1) {
+        if (tid < FUSED_BN) {
+            int gn = block_n + tid;
+            if (FULL_TILE || gn < N)
+                smem_scales[tid] = load_quant_scale_device(scales, scales_dtype, (int64_t)gn);
+        }
+        __syncthreads();
+    }
+
+    if constexpr (FULL_TILE && USE_CP_ASYNC_X) {
+        // Single-buffer: cp.async X overlaps with synchronous W load
+        int cached_group = -1;
+        for (int k_start = 0; k_start < K; k_start += BK) {
+            // Cooperatively cache per-group scales in shared memory
+            if constexpr (GROUP_SIZE_CONST == 128) {
+                int group = k_start >> 7;
+                if (group != cached_group) {
+                    if (tid < FUSED_BN) {
+                        int gn = block_n + tid;
+                        smem_scales[tid] = load_quant_scale_device(scales, scales_dtype,
+                                                                    (int64_t)gn * num_groups + group);
+                    }
+                    cached_group = group;
+                    __syncthreads();
+                }
+            }
+            load_x_tile(k_start);
+            cp_async_commit_group();
+            load_w_tile(k_start);
+            cp_async_wait_all();
+            __syncthreads();
+            mma_stage();
+            __syncthreads();
+        }
+    } else {
+        int cached_group = -1;
+        for (int k_start = 0; k_start < K; k_start += BK) {
+            // Cooperatively cache per-group scales in shared memory
+            if constexpr (GROUP_SIZE_CONST == 128) {
+                int group = k_start >> 7;
+                if (group != cached_group) {
+                    if (tid < FUSED_BN) {
+                        int gn = block_n + tid;
+                        if (FULL_TILE || gn < N)
+                            smem_scales[tid] = load_quant_scale_device(scales, scales_dtype,
+                                                                        (int64_t)gn * num_groups + group);
+                    }
+                    cached_group = group;
+                    __syncthreads();
+                }
+            }
+            load_x_tile(k_start);
+            load_w_tile(k_start);
+            __syncthreads();
+            mma_stage();
+            __syncthreads();
+        }
+    }
+
+    // Output phase: store accumulators to shared memory, then write to global.
+    // Pad output stride by 2 floats to eliminate shared memory bank conflicts
+    // on wmma::store_matrix_sync (stride 66 → row j hits bank (j*66)%32 = j*2, all unique).
+    constexpr int OUT_STRIDE = FUSED_BN + 2;
+    float* smem_out = reinterpret_cast<float*>(smem_raw);
+
+    #pragma unroll
+    for (int sm = 0; sm < 2; sm++)
+        #pragma unroll
+        for (int sn = 0; sn < 2; sn++)
+            wmma::store_matrix_sync(
+                &smem_out[(warp_m * 32 + sm * 16) * OUT_STRIDE + (warp_n * 32 + sn * 16)],
+                acc[sm][sn], OUT_STRIDE, wmma::mem_row_major);
+
+    __syncthreads();
+
+    if constexpr (FULL_TILE) {
+        constexpr int OUT_VEC4 = FUSED_BM * (FUSED_BN / 4);  // 1024
+        const int col_vec = tid & (FUSED_BN / 4 - 1);        // 0..15
+        float4 b4 = make_float4(0.f, 0.f, 0.f, 0.f);
+        if (bias) {
+            b4 = *reinterpret_cast<const float4*>(bias + block_n + col_vec * 4);
+        }
+
+        for (int i4 = tid; i4 < OUT_VEC4; i4 += 128) {
+            int local_m = i4 / (FUSED_BN / 4);
+            int local_n4 = (i4 % (FUSED_BN / 4)) * 4;
+            // Scalar smem reads avoid float4 misalignment from padded stride
+            int si = local_m * OUT_STRIDE + local_n4;
+            float4 v = make_float4(smem_out[si], smem_out[si + 1],
+                                   smem_out[si + 2], smem_out[si + 3]);
+            if (bias) {
+                v.x += b4.x; v.y += b4.y; v.z += b4.z; v.w += b4.w;
+            }
+            *reinterpret_cast<float4*>(Y + (int64_t)(block_m + local_m) * N + block_n + local_n4) = v;
+        }
+    } else {
+        const int lane_col = tid & (FUSED_BN - 1);  // constant across loop because stride=128
+        float bias_val = 0.0f;
+        bool bias_valid = false;
+        if (bias) {
+            int gn0 = block_n + lane_col;
+            if (gn0 < N) {
+                bias_val = bias[gn0];
+                bias_valid = true;
+            }
+        }
+
+        for (int i = tid; i < FUSED_BM * FUSED_BN; i += 128) {
+            int local_m = i / FUSED_BN;
+            int local_n = i % FUSED_BN;
+            int gm = block_m + local_m;
+            int gn = block_n + local_n;
+            if (gm < M && gn < N) {
+                float val = smem_out[local_m * OUT_STRIDE + local_n];
+                if (bias_valid) val += bias_val;
+                Y[(int64_t)gm * N + gn] = val;
+            }
+        }
+    }
+}
+
+template<int BK, int GROUP_SIZE_CONST>
+static void launch_fused_dequant_gemm_variant(const __nv_bfloat16* X, const int8_t* W,
+                                              const void* scales, DType scales_dtype,
+                                              const float* bias, float* Y,
+                                              int M, int N, int K, int group_size) {
+    dim3 grid_all((N + FUSED_BN - 1) / FUSED_BN, (M + FUSED_BM - 1) / FUSED_BM);
+    dim3 block(128);
+
+    const size_t out_smem = (size_t)FUSED_BM * (FUSED_BN + 2) * sizeof(float);
+    const size_t tile_smem_single = (size_t)(FUSED_BM + FUSED_BN) * (BK + FUSED_PAD) * sizeof(__nv_bfloat16)
+                                  + (size_t)FUSED_BN * sizeof(float);
+    const size_t smem_edge = tile_smem_single > out_smem ? tile_smem_single : out_smem;
+    const size_t smem_full = tile_smem_single > out_smem ? tile_smem_single : out_smem;
+
+    const bool full_k = (K % BK) == 0;
+    const int full_n = full_k ? (N / FUSED_BN) : 0;
+    const int full_m = full_k ? (M / FUSED_BM) : 0;
+
+    if (full_n > 0 && full_m > 0) {
+        dim3 grid_full(full_n, full_m);
+        fused_dequant_gemm_kernel_t<BK, GROUP_SIZE_CONST, true, true>
+            <<<grid_full, block, smem_full>>>(
+                X, W, scales, (int)scales_dtype, bias, Y, M, N, K, group_size, 0, 0);
+    }
+
+    if (full_n != (int)grid_all.x || full_m != (int)grid_all.y) {
+        fused_dequant_gemm_kernel_t<BK, GROUP_SIZE_CONST, false, false>
+            <<<grid_all, block, smem_edge>>>(
+                X, W, scales, (int)scales_dtype, bias, Y, M, N, K, group_size, full_n, full_m);
+    } else if (full_n == 0 || full_m == 0) {
+        fused_dequant_gemm_kernel_t<BK, GROUP_SIZE_CONST, false, false>
+            <<<grid_all, block, smem_edge>>>(
+                X, W, scales, (int)scales_dtype, bias, Y, M, N, K, group_size, 0, 0);
+    }
+}
+
+void fused_dequant_gemm_cuda(const __nv_bfloat16* X, const int8_t* W,
+                              const void* scales, DType scales_dtype, const float* bias,
+                              float* Y, int M, int N, int K, int group_size) {
+    // Lightweight heuristic "autotune": prefer BK=64 on larger, aligned problems.
+    bool use_bk64 = (K % 64 == 0) && (K >= 256) && (M >= 32) && (N >= 32);
+
+    if (group_size == 128) {
+        if (use_bk64) {
+            launch_fused_dequant_gemm_variant<64, 128>(X, W, scales, scales_dtype, bias, Y, M, N, K, group_size);
+        } else {
+            launch_fused_dequant_gemm_variant<32, 128>(X, W, scales, scales_dtype, bias, Y, M, N, K, group_size);
+        }
+        return;
+    }
+
+    // Legacy per-channel scales (single scale per row) benefit from a dedicated specialization.
+    if (group_size >= K) {
+        if (use_bk64) {
+            launch_fused_dequant_gemm_variant<64, -1>(X, W, scales, scales_dtype, bias, Y, M, N, K, group_size);
+        } else {
+            launch_fused_dequant_gemm_variant<32, -1>(X, W, scales, scales_dtype, bias, Y, M, N, K, group_size);
+        }
+        return;
+    }
+
+    if (use_bk64) {
+        launch_fused_dequant_gemm_variant<64, 0>(X, W, scales, scales_dtype, bias, Y, M, N, K, group_size);
+    } else {
+        launch_fused_dequant_gemm_variant<32, 0>(X, W, scales, scales_dtype, bias, Y, M, N, K, group_size);
+    }
+}
+
+#undef FUSED_BM
+#undef FUSED_BN
+#undef FUSED_PAD

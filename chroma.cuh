@@ -59,6 +59,34 @@ static Tensor linear_forward(const Tensor& x, const Tensor& W, const Tensor* bia
 }
 
 // ============================================================================
+// Helper: Load weight with optional INT8 companion scales
+// If the tensor is INT8, loads the companion .scale tensor and attaches it.
+// Weights stay in original [N,K] row-major layout; the GEMM handles transpose.
+// Works transparently for BF16 files (no scales loaded).
+// ============================================================================
+static Tensor load_weight(const SafetensorsFile& sf, const std::string& name) {
+    Tensor w = sf.load_tensor_native(name);
+    if (w.dtype == DType::INT8 && w.ndim == 2) {
+        // Load companion scale tensor
+        std::string scale_name = name + ".scale";
+        Tensor scale_t = sf.load_tensor_native(scale_name);
+        assert(scale_t.dtype == DType::F32 || scale_t.dtype == DType::FP16 || scale_t.dtype == DType::BF16);
+        w.quant_scales = scale_t.data;
+        w.quant_scales_dtype = scale_t.dtype;
+        scale_t.owns_data = false;  // arena owns memory
+        if (scale_t.ndim == 2) {
+            // Per-group: scale shape [N, num_groups]
+            int64_t num_groups = scale_t.shape[1];
+            w.quant_group_size = (int)((w.shape[1] + num_groups - 1) / num_groups);
+        } else {
+            // Per-channel (legacy): group_size = K (entire row is one group)
+            w.quant_group_size = (int)w.shape[1];
+        }
+    }
+    return w;
+}
+
+// ============================================================================
 // ChromaApproximator
 // ============================================================================
 struct ChromaApproximator {
@@ -73,18 +101,18 @@ struct ChromaApproximator {
 
     void load(const SafetensorsFile& sf) {
         std::string p = "distilled_guidance_layer.";
-        in_proj_w = sf.load_tensor_native(p + "in_proj.weight");
+        in_proj_w = load_weight(sf, p + "in_proj.weight");
         in_proj_b = sf.load_tensor(p + "in_proj.bias", DType::F32);
-        out_proj_w = sf.load_tensor_native(p + "out_proj.weight");
+        out_proj_w = load_weight(sf, p + "out_proj.weight");
         out_proj_b = sf.load_tensor(p + "out_proj.bias", DType::F32);
 
         for (int i = 0; i < 5; i++) {
             std::string lp = p + "layers." + std::to_string(i) + ".";
             std::string np = p + "norms." + std::to_string(i) + ".";
             layers[i].norm_scale = sf.load_tensor(np + "scale", DType::F32);
-            layers[i].in_w = sf.load_tensor_native(lp + "in_layer.weight");
+            layers[i].in_w = load_weight(sf, lp + "in_layer.weight");
             layers[i].in_b = sf.load_tensor(lp + "in_layer.bias", DType::F32);
-            layers[i].out_w = sf.load_tensor_native(lp + "out_layer.weight");
+            layers[i].out_w = load_weight(sf, lp + "out_layer.weight");
             layers[i].out_b = sf.load_tensor(lp + "out_layer.bias", DType::F32);
         }
     }
@@ -172,26 +200,26 @@ struct DoubleStreamBlockWeights {
         DoubleStreamBlockWeights w;
         std::string p = "double_blocks." + std::to_string(idx) + ".";
 
-        w.img_qkv_w = sf.load_tensor_native(p + "img_attn.qkv.weight");
+        w.img_qkv_w = load_weight(sf, p + "img_attn.qkv.weight");
         w.img_qkv_b = sf.load_tensor(p + "img_attn.qkv.bias", DType::F32);
         w.img_q_norm = sf.load_tensor(p + "img_attn.norm.query_norm.scale", DType::F32);
         w.img_k_norm = sf.load_tensor(p + "img_attn.norm.key_norm.scale", DType::F32);
-        w.img_proj_w = sf.load_tensor_native(p + "img_attn.proj.weight");
+        w.img_proj_w = load_weight(sf, p + "img_attn.proj.weight");
         w.img_proj_b = sf.load_tensor(p + "img_attn.proj.bias", DType::F32);
-        w.img_mlp_0_w = sf.load_tensor_native(p + "img_mlp.0.weight");
+        w.img_mlp_0_w = load_weight(sf, p + "img_mlp.0.weight");
         w.img_mlp_0_b = sf.load_tensor(p + "img_mlp.0.bias", DType::F32);
-        w.img_mlp_2_w = sf.load_tensor_native(p + "img_mlp.2.weight");
+        w.img_mlp_2_w = load_weight(sf, p + "img_mlp.2.weight");
         w.img_mlp_2_b = sf.load_tensor(p + "img_mlp.2.bias", DType::F32);
 
-        w.txt_qkv_w = sf.load_tensor_native(p + "txt_attn.qkv.weight");
+        w.txt_qkv_w = load_weight(sf, p + "txt_attn.qkv.weight");
         w.txt_qkv_b = sf.load_tensor(p + "txt_attn.qkv.bias", DType::F32);
         w.txt_q_norm = sf.load_tensor(p + "txt_attn.norm.query_norm.scale", DType::F32);
         w.txt_k_norm = sf.load_tensor(p + "txt_attn.norm.key_norm.scale", DType::F32);
-        w.txt_proj_w = sf.load_tensor_native(p + "txt_attn.proj.weight");
+        w.txt_proj_w = load_weight(sf, p + "txt_attn.proj.weight");
         w.txt_proj_b = sf.load_tensor(p + "txt_attn.proj.bias", DType::F32);
-        w.txt_mlp_0_w = sf.load_tensor_native(p + "txt_mlp.0.weight");
+        w.txt_mlp_0_w = load_weight(sf, p + "txt_mlp.0.weight");
         w.txt_mlp_0_b = sf.load_tensor(p + "txt_mlp.0.bias", DType::F32);
-        w.txt_mlp_2_w = sf.load_tensor_native(p + "txt_mlp.2.weight");
+        w.txt_mlp_2_w = load_weight(sf, p + "txt_mlp.2.weight");
         w.txt_mlp_2_b = sf.load_tensor(p + "txt_mlp.2.bias", DType::F32);
 
         return w;
@@ -216,9 +244,9 @@ struct SingleStreamBlockWeights {
         SingleStreamBlockWeights w;
         std::string p = "single_blocks." + std::to_string(idx) + ".";
 
-        w.linear1_w = sf.load_tensor_native(p + "linear1.weight");
+        w.linear1_w = load_weight(sf, p + "linear1.weight");
         w.linear1_b = sf.load_tensor(p + "linear1.bias", DType::F32);
-        w.linear2_w = sf.load_tensor_native(p + "linear2.weight");
+        w.linear2_w = load_weight(sf, p + "linear2.weight");
         w.linear2_b = sf.load_tensor(p + "linear2.bias", DType::F32);
         w.q_norm = sf.load_tensor(p + "norm.query_norm.scale", DType::F32);
         w.k_norm = sf.load_tensor(p + "norm.key_norm.scale", DType::F32);
@@ -242,7 +270,7 @@ struct NerfGLUBlockWeights {
     static NerfGLUBlockWeights load(const SafetensorsFile& sf, int idx) {
         NerfGLUBlockWeights w;
         std::string p = "nerf_blocks." + std::to_string(idx) + ".";
-        w.param_gen_w = sf.load_tensor_native(p + "param_generator.weight");
+        w.param_gen_w = load_weight(sf, p + "param_generator.weight");
         w.param_gen_b = sf.load_tensor(p + "param_generator.bias", DType::F32);
         w.norm_scale = sf.load_tensor(p + "norm.scale", DType::F32);
         return w;
@@ -278,6 +306,9 @@ struct ChromaRadiance {
     // GPU arena: single allocation for all weights (declared first → destroyed last)
     GPUArena weight_arena;
 
+    // Auto-detected from file: true if weights are INT8 quantized
+    bool is_int8 = false;
+
     // Small always-resident weights
     Tensor img_in_patch_w, img_in_patch_b;  // Conv2d(3→3072, 16×16)
     Tensor txt_in_w, txt_in_b;              // Linear(4096→3072)
@@ -308,14 +339,23 @@ struct ChromaRadiance {
         }
         gpu_pool().arena = &weight_arena;
 
+        // Auto-detect INT8: check dtype of a representative weight tensor
+        {
+            auto it = sf.tensors.find("double_blocks.0.img_attn.qkv.weight");
+            if (it != sf.tensors.end() && it->second.dtype == DType::INT8) {
+                is_int8 = true;
+                printf("  Detected INT8 quantized weights\n");
+            }
+        }
+
         // Small resident weights
-        img_in_patch_w = sf.load_tensor_native("img_in_patch.weight");
+        img_in_patch_w = load_weight(sf, "img_in_patch.weight");
         img_in_patch_b = sf.load_tensor("img_in_patch.bias", DType::F32);
-        txt_in_w = sf.load_tensor_native("txt_in.weight");
+        txt_in_w = load_weight(sf, "txt_in.weight");
         txt_in_b = sf.load_tensor("txt_in.bias", DType::F32);
 
         // NeRF small weights
-        nerf_small.embedder_w = sf.load_tensor_native("nerf_image_embedder.embedder.0.weight");
+        nerf_small.embedder_w = load_weight(sf, "nerf_image_embedder.embedder.0.weight");
         nerf_small.embedder_b = sf.load_tensor("nerf_image_embedder.embedder.0.bias", DType::F32);
         nerf_small.final_norm_scale = sf.load_tensor("nerf_final_layer_conv.norm.scale", DType::F32);
         nerf_small.final_conv_w = sf.load_tensor("nerf_final_layer_conv.conv.weight", DType::F32);
@@ -360,8 +400,9 @@ struct ChromaRadiance {
         for (auto& w : single_block_weights) w.disown();
         for (auto& w : nerf_block_weights) w.disown();
 
-        printf("Chroma Radiance model loaded: %.2f GB arena (%.2f GB used).\n",
-               weight_arena.capacity / 1e9, weight_arena.used / 1e9);
+        printf("Chroma Radiance model loaded: %.2f GB arena (%.2f GB used)%s.\n",
+               weight_arena.capacity / 1e9, weight_arena.used / 1e9,
+               is_int8 ? " [INT8 quantized]" : "");
     }
 
     // ======================================================================
@@ -462,28 +503,45 @@ struct ChromaRadiance {
         Tensor img_k_view = Tensor::wrap_gpu(all_k.f32() + txt_tokens * hidden_size, {img_tokens, (int64_t)hidden_size}, DType::F32);
         Tensor img_v_view = Tensor::wrap_gpu(all_v.f32() + txt_tokens * hidden_size, {img_tokens, (int64_t)hidden_size}, DType::F32);
 
+        // Helper: create a weight view for a row slice of a concatenated weight matrix
+        // Handles both INT8 (offsets data + per-group quant_scales) and BF16/FP16 (offsets data only)
+        auto wrap_weight_view = [](const Tensor& parent, int64_t row_off, int64_t nrows, int64_t ncols) {
+            size_t row_bytes = ncols * dtype_size(parent.dtype);
+            if (parent.dtype == DType::INT8) {
+                int num_groups = (int)((ncols + parent.quant_group_size - 1) / parent.quant_group_size);
+                return Tensor::wrap_gpu_int8(
+                    (char*)parent.data + row_bytes * row_off, {nrows, ncols},
+                    parent.quant_scales
+                        ? (char*)parent.quant_scales + (int64_t)row_off * num_groups * dtype_size(parent.quant_scales_dtype)
+                        : nullptr,
+                    parent.quant_scales_dtype,
+                    parent.quant_group_size);
+            }
+            return Tensor::wrap_gpu(
+                (char*)parent.data + row_bytes * row_off, {nrows, ncols}, parent.dtype);
+        };
+
         // === Image attention ===
         Tensor img_mod = Tensor::alloc({img_tokens, (int64_t)hidden_size}, DType::F32, true);
         modulate_cuda(img.f32(), img_shift1, img_scale1, img_mod.f32(),
                       img_tokens, hidden_size, 1e-6f);
 
-        // Convert img_mod to BF16 once for all 3 QKV projections (shared BF16 conversion)
-        size_t qkv_row_bytes = (int64_t)hidden_size * dtype_size(w.img_qkv_w.dtype);
-        Tensor iq_w = Tensor::wrap_gpu(w.img_qkv_w.data, {(int64_t)hidden_size, (int64_t)hidden_size}, w.img_qkv_w.dtype);
-        Tensor ik_w = Tensor::wrap_gpu((char*)w.img_qkv_w.data + qkv_row_bytes * hidden_size, {(int64_t)hidden_size, (int64_t)hidden_size}, w.img_qkv_w.dtype);
-        Tensor iv_w = Tensor::wrap_gpu((char*)w.img_qkv_w.data + qkv_row_bytes * 2 * hidden_size, {(int64_t)hidden_size, (int64_t)hidden_size}, w.img_qkv_w.dtype);
+        // Split QKV weight [9216, 3072] into 3 views of [3072, 3072]
+        Tensor iq_w = wrap_weight_view(w.img_qkv_w, 0, hidden_size, hidden_size);
+        Tensor ik_w = wrap_weight_view(w.img_qkv_w, hidden_size, hidden_size, hidden_size);
+        Tensor iv_w = wrap_weight_view(w.img_qkv_w, 2 * hidden_size, hidden_size, hidden_size);
         Tensor iq_b = Tensor::wrap_gpu(w.img_qkv_b.f32(), {(int64_t)hidden_size}, DType::F32);
         Tensor ik_b = Tensor::wrap_gpu(w.img_qkv_b.f32() + hidden_size, {(int64_t)hidden_size}, DType::F32);
         Tensor iv_b = Tensor::wrap_gpu(w.img_qkv_b.f32() + 2 * hidden_size, {(int64_t)hidden_size}, DType::F32);
 
-        // Shared BF16 conversion: convert once, reuse for Q/K/V
-        Tensor img_mod_bf16 = Tensor::alloc({img_tokens, (int64_t)hidden_size}, DType::BF16, true);
-        f32_to_bf16_cuda(img_mod.f32(), img_mod_bf16.bf16(), img_mod.numel());
-
-        // Write directly into joint buffer views (eliminates concat)
-        linear(img_mod_bf16, iq_w, &iq_b, img_q_view);
-        linear(img_mod_bf16, ik_w, &ik_b, img_k_view);
-        linear(img_mod_bf16, iv_w, &iv_b, img_v_view);
+        {
+            // Shared BF16 conversion for Q/K/V (works for both BF16 and INT8 weights)
+            Tensor img_mod_bf16 = Tensor::alloc({img_tokens, (int64_t)hidden_size}, DType::BF16, true);
+            f32_to_bf16_cuda(img_mod.f32(), img_mod_bf16.bf16(), img_mod.numel());
+            linear(img_mod_bf16, iq_w, &iq_b, img_q_view);
+            linear(img_mod_bf16, ik_w, &ik_b, img_k_view);
+            linear(img_mod_bf16, iv_w, &iv_b, img_v_view);
+        }
 
         qk_norm(img_q_view.f32(), w.img_q_norm.f32(), img_tokens, num_heads, d_head);
         qk_norm(img_k_view.f32(), w.img_k_norm.f32(), img_tokens, num_heads, d_head);
@@ -493,21 +551,21 @@ struct ChromaRadiance {
         modulate_cuda(txt.f32(), txt_shift1, txt_scale1, txt_mod_t.f32(),
                       txt_tokens, hidden_size, 1e-6f);
 
-        // Shared BF16 conversion for txt
-        Tensor tq_w = Tensor::wrap_gpu(w.txt_qkv_w.data, {(int64_t)hidden_size, (int64_t)hidden_size}, w.txt_qkv_w.dtype);
-        Tensor tk_w = Tensor::wrap_gpu((char*)w.txt_qkv_w.data + qkv_row_bytes * hidden_size, {(int64_t)hidden_size, (int64_t)hidden_size}, w.txt_qkv_w.dtype);
-        Tensor tv_w = Tensor::wrap_gpu((char*)w.txt_qkv_w.data + qkv_row_bytes * 2 * hidden_size, {(int64_t)hidden_size, (int64_t)hidden_size}, w.txt_qkv_w.dtype);
+        // Split txt QKV weight views
+        Tensor tq_w = wrap_weight_view(w.txt_qkv_w, 0, hidden_size, hidden_size);
+        Tensor tk_w = wrap_weight_view(w.txt_qkv_w, hidden_size, hidden_size, hidden_size);
+        Tensor tv_w = wrap_weight_view(w.txt_qkv_w, 2 * hidden_size, hidden_size, hidden_size);
         Tensor tq_b = Tensor::wrap_gpu(w.txt_qkv_b.f32(), {(int64_t)hidden_size}, DType::F32);
         Tensor tk_b = Tensor::wrap_gpu(w.txt_qkv_b.f32() + hidden_size, {(int64_t)hidden_size}, DType::F32);
         Tensor tv_b = Tensor::wrap_gpu(w.txt_qkv_b.f32() + 2 * hidden_size, {(int64_t)hidden_size}, DType::F32);
 
-        Tensor txt_mod_bf16 = Tensor::alloc({txt_tokens, (int64_t)hidden_size}, DType::BF16, true);
-        f32_to_bf16_cuda(txt_mod_t.f32(), txt_mod_bf16.bf16(), txt_mod_t.numel());
-
-        // Write directly into joint buffer views
-        linear(txt_mod_bf16, tq_w, &tq_b, txt_q_view);
-        linear(txt_mod_bf16, tk_w, &tk_b, txt_k_view);
-        linear(txt_mod_bf16, tv_w, &tv_b, txt_v_view);
+        {
+            Tensor txt_mod_bf16 = Tensor::alloc({txt_tokens, (int64_t)hidden_size}, DType::BF16, true);
+            f32_to_bf16_cuda(txt_mod_t.f32(), txt_mod_bf16.bf16(), txt_mod_t.numel());
+            linear(txt_mod_bf16, tq_w, &tq_b, txt_q_view);
+            linear(txt_mod_bf16, tk_w, &tk_b, txt_k_view);
+            linear(txt_mod_bf16, tv_w, &tv_b, txt_v_view);
+        }
 
         qk_norm(txt_q_view.f32(), w.txt_q_norm.f32(), txt_tokens, num_heads, d_head);
         qk_norm(txt_k_view.f32(), w.txt_k_norm.f32(), txt_tokens, num_heads, d_head);
@@ -579,33 +637,46 @@ struct ChromaRadiance {
 
         // Separate Q/K/V/MLP projections using weight views (eliminates slice_columns)
         // linear1_w is [21504, 3072]: rows [0:3072]=Q, [3072:6144]=K, [6144:9216]=V, [9216:21504]=MLP
-        size_t l1_row_bytes = (int64_t)hidden_size * dtype_size(w.linear1_w.dtype);
-        Tensor sq_w = Tensor::wrap_gpu(w.linear1_w.data,
-                                        {(int64_t)hidden_size, (int64_t)hidden_size}, w.linear1_w.dtype);
-        Tensor sk_w = Tensor::wrap_gpu((char*)w.linear1_w.data + l1_row_bytes * hidden_size,
-                                        {(int64_t)hidden_size, (int64_t)hidden_size}, w.linear1_w.dtype);
-        Tensor sv_w = Tensor::wrap_gpu((char*)w.linear1_w.data + l1_row_bytes * 2 * hidden_size,
-                                        {(int64_t)hidden_size, (int64_t)hidden_size}, w.linear1_w.dtype);
-        Tensor sm_w = Tensor::wrap_gpu((char*)w.linear1_w.data + l1_row_bytes * 3 * hidden_size,
-                                        {(int64_t)mlp_hidden, (int64_t)hidden_size}, w.linear1_w.dtype);
+        auto wrap_wv = [](const Tensor& parent, int64_t row_off, int64_t nrows, int64_t ncols) {
+            size_t row_bytes = ncols * dtype_size(parent.dtype);
+            if (parent.dtype == DType::INT8) {
+                int num_groups = (int)((ncols + parent.quant_group_size - 1) / parent.quant_group_size);
+                return Tensor::wrap_gpu_int8(
+                    (char*)parent.data + row_bytes * row_off, {nrows, ncols},
+                    parent.quant_scales
+                        ? (char*)parent.quant_scales + (int64_t)row_off * num_groups * dtype_size(parent.quant_scales_dtype)
+                        : nullptr,
+                    parent.quant_scales_dtype,
+                    parent.quant_group_size);
+            }
+            return Tensor::wrap_gpu(
+                (char*)parent.data + row_bytes * row_off, {nrows, ncols}, parent.dtype);
+        };
+
+        Tensor sq_w = wrap_wv(w.linear1_w, 0, hidden_size, hidden_size);
+        Tensor sk_w = wrap_wv(w.linear1_w, hidden_size, hidden_size, hidden_size);
+        Tensor sv_w = wrap_wv(w.linear1_w, 2 * hidden_size, hidden_size, hidden_size);
+        Tensor sm_w = wrap_wv(w.linear1_w, 3 * hidden_size, mlp_hidden, hidden_size);
         // Split bias [21504] into Q[0:3072], K[3072:6144], V[6144:9216], MLP[9216:21504]
         Tensor sq_b = Tensor::wrap_gpu(w.linear1_b.f32(), {(int64_t)hidden_size}, DType::F32);
         Tensor sk_b = Tensor::wrap_gpu(w.linear1_b.f32() + hidden_size, {(int64_t)hidden_size}, DType::F32);
         Tensor sv_b = Tensor::wrap_gpu(w.linear1_b.f32() + 2 * hidden_size, {(int64_t)hidden_size}, DType::F32);
         Tensor sm_b = Tensor::wrap_gpu(w.linear1_b.f32() + 3 * hidden_size, {(int64_t)mlp_hidden}, DType::F32);
 
-        // Shared BF16 conversion: convert x_mod once, reuse for all 4 projections
-        Tensor x_mod_bf16 = Tensor::alloc({L, (int64_t)hidden_size}, DType::BF16, true);
-        f32_to_bf16_cuda(x_mod.f32(), x_mod_bf16.bf16(), x_mod.numel());
-
         Tensor q_t = Tensor::alloc({L, (int64_t)hidden_size}, DType::F32, true);
         Tensor k_t = Tensor::alloc({L, (int64_t)hidden_size}, DType::F32, true);
         Tensor v_t = Tensor::alloc({L, (int64_t)hidden_size}, DType::F32, true);
         Tensor mlp_t = Tensor::alloc({L, (int64_t)mlp_hidden}, DType::F32, true);
-        linear(x_mod_bf16, sq_w, &sq_b, q_t);
-        linear(x_mod_bf16, sk_w, &sk_b, k_t);
-        linear(x_mod_bf16, sv_w, &sv_b, v_t);
-        linear(x_mod_bf16, sm_w, &sm_b, mlp_t);
+
+        {
+            // Shared BF16 conversion for Q/K/V/MLP (works for both BF16 and INT8 weights)
+            Tensor x_mod_bf16 = Tensor::alloc({L, (int64_t)hidden_size}, DType::BF16, true);
+            f32_to_bf16_cuda(x_mod.f32(), x_mod_bf16.bf16(), x_mod.numel());
+            linear(x_mod_bf16, sq_w, &sq_b, q_t);
+            linear(x_mod_bf16, sk_w, &sk_b, k_t);
+            linear(x_mod_bf16, sv_w, &sv_b, v_t);
+            linear(x_mod_bf16, sm_w, &sm_b, mlp_t);
+        }
 
         // QKNorm
         qk_norm(q_t.f32(), w.q_norm.f32(), L, num_heads, d_head);

@@ -302,6 +302,10 @@ int main(int argc, char** argv) {
     chroma.debug_diag = args.debug;
     chroma.load(chroma_file);
 
+    if (chroma.is_int8) {
+        printf("Weight precision: INT8 (quantized)\n");
+    }
+
     // Release chroma mmap — all weights are now on GPU
     chroma_file.~SafetensorsFile();
     new (&chroma_file) SafetensorsFile();

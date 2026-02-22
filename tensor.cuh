@@ -111,13 +111,14 @@ static GPUMemPool& gpu_pool() {
     return pool;
 }
 
-enum class DType { F32, FP16, BF16 };
+enum class DType { F32, FP16, BF16, INT8 };
 
 static inline size_t dtype_size(DType dt) {
     switch (dt) {
         case DType::F32:  return 4;
         case DType::FP16: return 2;
         case DType::BF16: return 2;
+        case DType::INT8: return 1;
     }
     return 0;
 }
@@ -127,12 +128,16 @@ static inline const char* dtype_name(DType dt) {
         case DType::F32:  return "F32";
         case DType::FP16: return "FP16";
         case DType::BF16: return "BF16";
+        case DType::INT8: return "INT8";
     }
     return "?";
 }
 
 struct Tensor {
     void* data = nullptr;
+    void* quant_scales = nullptr;   // per-group scales for INT8 weights (GPU, arena-owned)
+    DType quant_scales_dtype = DType::F32;
+    int quant_group_size = 0;       // 0 = not quantized, >0 = per-group scale granularity
     int64_t shape[4] = {0, 0, 0, 0};
     int64_t stride[4] = {0, 0, 0, 0};  // in elements
     int ndim = 0;
@@ -146,6 +151,8 @@ struct Tensor {
     Tensor(Tensor&& o) noexcept {
         memcpy(this, &o, sizeof(Tensor));
         o.data = nullptr;
+        o.quant_scales = nullptr;
+        o.quant_scales_dtype = DType::F32;
         o.owns_data = false;
     }
     Tensor& operator=(Tensor&& o) noexcept {
@@ -153,6 +160,8 @@ struct Tensor {
             free_data();
             memcpy(this, &o, sizeof(Tensor));
             o.data = nullptr;
+            o.quant_scales = nullptr;
+            o.quant_scales_dtype = DType::F32;
             o.owns_data = false;
         }
         return *this;
@@ -173,6 +182,8 @@ struct Tensor {
             }
         }
         data = nullptr;
+        quant_scales = nullptr;
+        quant_scales_dtype = DType::F32;
         owns_data = false;
     }
 
@@ -275,6 +286,28 @@ struct Tensor {
         return t;
     }
 
+    static Tensor wrap_gpu_int8(void* ptr, std::initializer_list<int64_t> dims,
+                                void* scales, DType scales_dtype, int group_size) {
+        Tensor t;
+        t.ndim = (int)dims.size();
+        int i = 0;
+        for (auto d : dims) t.shape[i++] = d;
+        t.dtype = DType::INT8;
+        t.on_gpu = true;
+        t.owns_data = false;
+        t.data = ptr;
+        t.quant_scales = scales;
+        t.quant_scales_dtype = scales_dtype;
+        t.quant_group_size = group_size;
+        t.compute_strides();
+        return t;
+    }
+
+    static Tensor wrap_gpu_int8(void* ptr, std::initializer_list<int64_t> dims,
+                                float* scales, int group_size) {
+        return wrap_gpu_int8(ptr, dims, (void*)scales, DType::F32, group_size);
+    }
+
     // Copy to GPU
     Tensor to_gpu() const {
         assert(is_contiguous());
@@ -314,6 +347,9 @@ struct Tensor {
         assert(is_contiguous());
         Tensor t;
         t.data = const_cast<void*>(data);
+        t.quant_scales = quant_scales;
+        t.quant_scales_dtype = quant_scales_dtype;
+        t.quant_group_size = quant_group_size;
         t.ndim = (int)new_shape.size();
         t.dtype = dtype;
         t.on_gpu = on_gpu;
@@ -331,6 +367,18 @@ struct Tensor {
         assert(start >= 0 && start + count <= shape[0]);
         Tensor t;
         t.data = (char*)data + start * stride[0] * dtype_size(dtype);
+        if (quant_scales && quant_group_size > 0 && ndim >= 2) {
+            // Per-group scales: shape [N, num_groups], offset by start * num_groups
+            int num_groups = (int)((shape[1] + quant_group_size - 1) / quant_group_size);
+            t.quant_scales = (char*)quant_scales +
+                             (start * num_groups) * (int64_t)dtype_size(quant_scales_dtype);
+        } else {
+            t.quant_scales = quant_scales
+                ? (char*)quant_scales + start * (int64_t)dtype_size(quant_scales_dtype)
+                : nullptr;
+        }
+        t.quant_scales_dtype = quant_scales_dtype;
+        t.quant_group_size = quant_group_size;
         t.ndim = ndim;
         for (int i = 0; i < ndim; i++) {
             t.shape[i] = (i == 0) ? count : shape[i];
@@ -346,6 +394,10 @@ struct Tensor {
     float* f32() const { assert(dtype == DType::F32); return (float*)data; }
     __half* fp16() const { assert(dtype == DType::FP16); return (__half*)data; }
     __nv_bfloat16* bf16() const { assert(dtype == DType::BF16); return (__nv_bfloat16*)data; }
+    int8_t* i8() const { assert(dtype == DType::INT8); return (int8_t*)data; }
+    float* qscales_f32() const { assert(quant_scales_dtype == DType::F32); return (float*)quant_scales; }
+    __half* qscales_fp16() const { assert(quant_scales_dtype == DType::FP16); return (__half*)quant_scales; }
+    __nv_bfloat16* qscales_bf16() const { assert(quant_scales_dtype == DType::BF16); return (__nv_bfloat16*)quant_scales; }
 
     void print_info(const char* name = "") const {
         printf("Tensor %s: [", name);
@@ -360,8 +412,21 @@ struct Tensor {
 // Conversion kernels declared here, defined in kernels.cu
 void bf16_to_f32_cuda(const __nv_bfloat16* src, float* dst, int64_t n);
 void fp16_to_f32_cuda(const __half* src, float* dst, int64_t n);
+void fp16_to_bf16_cuda(const __half* src, __nv_bfloat16* dst, int64_t n);
 void f32_to_bf16_cuda(const float* src, __nv_bfloat16* dst, int64_t n);
 void f32_to_fp16_cuda(const float* src, __half* dst, int64_t n);
+
+// INT8 dequantization kernel declared here, defined in kernels.cu
+// Dequantize INT8 weights to BF16 using per-group F32 scales
+void dequant_int8_to_bf16_cuda(const int8_t* src, const void* scales, DType scales_dtype,
+                                __nv_bfloat16* dst, int64_t N, int64_t K,
+                                int group_size);
+
+// Fused INT8 dequant + BF16 WMMA GEMM declared here, defined in kernels.cu
+// Y[M,N] = X[M,K] @ W[N,K]^T + bias[N], dequantizing W from INT8 on-the-fly
+void fused_dequant_gemm_cuda(const __nv_bfloat16* X, const int8_t* W,
+                              const void* scales, DType scales_dtype, const float* bias,
+                              float* Y, int M, int N, int K, int group_size);
 
 static inline Tensor to_f32_gpu(const Tensor& t) {
     if (t.dtype == DType::F32) return t.to_gpu();

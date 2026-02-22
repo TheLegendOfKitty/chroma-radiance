@@ -81,6 +81,7 @@ static void linear_lt(int64_t M, int64_t K, int64_t N,
 // x: [M, K], W: [N, K], bias: [N] or null, output: [M, N]
 // All stored row-major. Uses F32 accumulation.
 // Bias is fused into the GEMM epilogue via cublasLt (zero extra kernel launches).
+// INT8 weights: dequantized to BF16 with per-group scales, then BF16 GEMM.
 static void linear(const Tensor& x, const Tensor& W, const Tensor* bias, Tensor& output) {
     assert(x.on_gpu && W.on_gpu && output.on_gpu);
     assert(x.ndim >= 1 && W.ndim == 2);
@@ -92,6 +93,35 @@ static void linear(const Tensor& x, const Tensor& W, const Tensor* bias, Tensor&
     assert(output.numel() == M * N);
 
     const void* bias_data = (bias && bias->on_gpu && bias->dtype == DType::F32) ? bias->data : nullptr;
+
+    // INT8 weight path: fused dequant + WMMA GEMM (no N*K temp buffer)
+    if (W.dtype == DType::INT8) {
+        assert(W.quant_scales && W.quant_group_size > 0 && "INT8 weight missing quant_scales or group_size");
+
+        // Convert activation to BF16
+        const __nv_bfloat16* x_bf16;
+        Tensor x_conv;
+        if (x.dtype == DType::BF16) {
+            x_bf16 = x.bf16();
+        } else if (x.dtype == DType::F32) {
+            x_conv = Tensor::alloc_shape(x.ndim, x.shape, DType::BF16, true);
+            f32_to_bf16_cuda(x.f32(), x_conv.bf16(), x.numel());
+            x_bf16 = x_conv.bf16();
+        } else if (x.dtype == DType::FP16) {
+            x_conv = Tensor::alloc_shape(x.ndim, x.shape, DType::BF16, true);
+            fp16_to_bf16_cuda(x.fp16(), x_conv.bf16(), x.numel());
+            x_bf16 = x_conv.bf16();
+        } else {
+            fprintf(stderr, "Unsupported activation dtype for INT8 linear: %s\n", dtype_name(x.dtype));
+            exit(1);
+        }
+
+        // Fused INT8 dequant + BF16 GEMM (eliminates N*K temp buffer)
+        fused_dequant_gemm_cuda(x_bf16, W.i8(), W.quant_scales, W.quant_scales_dtype,
+                                (const float*)bias_data, output.f32(),
+                                (int)M, (int)N, (int)K, W.quant_group_size);
+        return;
+    }
 
     if (x.dtype == DType::F32 && W.dtype == DType::F32) {
         linear_lt(M, K, N, x.data, CUDA_R_32F, W.data, CUDA_R_32F, bias_data, output.data);
