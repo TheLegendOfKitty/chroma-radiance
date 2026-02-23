@@ -22,6 +22,14 @@ static size_t g_cublas_workspace_size = 32 * 1024 * 1024;  // 32MB
 static __nv_bfloat16* g_dequant_scratch = nullptr;
 static size_t g_dequant_scratch_elems = 0;
 
+// Persistent scratch buffers for INT8 activation quantization (reused across linear calls)
+static int8_t* g_act_int8_scratch = nullptr;
+static size_t g_act_int8_scratch_bytes = 0;
+static float* g_act_scale_scratch = nullptr;
+static size_t g_act_scale_scratch_elems = 0;
+static float* g_act_rowsum_scratch = nullptr;
+static size_t g_act_rowsum_scratch_elems = 0;
+
 // Algorithm cache: avoid repeated heuristic lookups for the same (M,N,K,types) combo
 struct LtAlgoKey {
     int64_t M, K, N;
@@ -73,6 +81,38 @@ static __nv_bfloat16* ensure_dequant_scratch(int64_t elems) {
     g_dequant_scratch_elems = (size_t)elems;
     return g_dequant_scratch;
 }
+
+static int8_t* ensure_act_int8_scratch(int64_t bytes) {
+    if (bytes <= (int64_t)g_act_int8_scratch_bytes) return g_act_int8_scratch;
+    if (g_act_int8_scratch) CHECK_CUDA(cudaFree(g_act_int8_scratch));
+    CHECK_CUDA(cudaMalloc(&g_act_int8_scratch, bytes));
+    g_act_int8_scratch_bytes = (size_t)bytes;
+    return g_act_int8_scratch;
+}
+
+static float* ensure_act_scale_scratch(int64_t elems) {
+    if (elems <= (int64_t)g_act_scale_scratch_elems) return g_act_scale_scratch;
+    if (g_act_scale_scratch) CHECK_CUDA(cudaFree(g_act_scale_scratch));
+    CHECK_CUDA(cudaMalloc(&g_act_scale_scratch, elems * sizeof(float)));
+    g_act_scale_scratch_elems = (size_t)elems;
+    return g_act_scale_scratch;
+}
+
+static float* ensure_act_rowsum_scratch(int64_t elems) {
+    if (elems <= (int64_t)g_act_rowsum_scratch_elems) return g_act_rowsum_scratch;
+    if (g_act_rowsum_scratch) CHECK_CUDA(cudaFree(g_act_rowsum_scratch));
+    CHECK_CUDA(cudaMalloc(&g_act_rowsum_scratch, elems * sizeof(float)));
+    g_act_rowsum_scratch_elems = (size_t)elems;
+    return g_act_rowsum_scratch;
+}
+
+// Pre-quantized activation state for INT8 TC GEMM path.
+struct QuantizedAct {
+    int8_t* x_int8 = nullptr;
+    float* x_scale = nullptr;
+    float* x_rowsum = nullptr;
+    int64_t M = 0, K = 0;
+};
 
 // cublasLt linear with fused bias epilogue
 // Row-major: output = x @ W^T + bias
@@ -272,48 +312,47 @@ static void linear(const Tensor& x, const Tensor& W, const Tensor* bias, Tensor&
         // Quantizes activations directly from native dtype (F32/BF16) — no intermediate conversion.
         // Decomposition: Y = x_scale * w_scale * (X_i8 @ W_i8^T - zp * x_rowsum) + bias
         // In-place: GEMM writes INT32 to output buffer, dequant overwrites with F32.
+        // Uses persistent scratch buffers to avoid per-call pool alloc/free overhead.
         if (W.quant_group_size >= (int)K && K % 4 == 0) {
             bool need_rowsum = (W.quant_zero_points != nullptr);
-            Tensor x_int8 = Tensor::alloc({M, K}, DType::INT8, true);
-            Tensor x_scale = Tensor::alloc({M}, DType::F32, true);
-            Tensor x_rowsum;
-            if (need_rowsum) x_rowsum = Tensor::alloc({M}, DType::F32, true);
+            int8_t* x_i8 = ensure_act_int8_scratch(M * K);
+            float* x_sc = ensure_act_scale_scratch(M);
+            float* x_rs = need_rowsum ? ensure_act_rowsum_scratch(M) : nullptr;
 
-            // Quantize activations directly from native dtype (skip f32→bf16 conversion)
             if (x.dtype == DType::F32) {
-                quantize_activations_int8_cuda(x.f32(), x_int8.i8(), x_scale.f32(),
-                                                need_rowsum ? x_rowsum.f32() : nullptr,
+                quantize_activations_int8_cuda(x.f32(), x_i8, x_sc, x_rs,
                                                 (int)M, (int)K, W.quant_smooth, need_rowsum);
             } else if (x.dtype == DType::BF16) {
-                quantize_activations_int8_cuda(x.bf16(), x_int8.i8(), x_scale.f32(),
-                                                need_rowsum ? x_rowsum.f32() : nullptr,
+                quantize_activations_int8_cuda(x.bf16(), x_i8, x_sc, x_rs,
                                                 (int)M, (int)K, W.quant_smooth, need_rowsum);
             } else {
-                // FP16: convert to BF16 first (rare)
                 Tensor x_conv = Tensor::alloc_shape(x.ndim, x.shape, DType::BF16, true);
                 fp16_to_bf16_cuda(x.fp16(), x_conv.bf16(), x.numel());
-                quantize_activations_int8_cuda(x_conv.bf16(), x_int8.i8(), x_scale.f32(),
-                                                need_rowsum ? x_rowsum.f32() : nullptr,
+                quantize_activations_int8_cuda(x_conv.bf16(), x_i8, x_sc, x_rs,
                                                 (int)M, (int)K, W.quant_smooth, need_rowsum);
             }
 
-            // INT8 GEMM → INT32, written directly to output buffer (both 4 bytes/elem)
-            linear_int8_gemm(M, K, N, x_int8.i8(), W.i8(), (int32_t*)output.data);
+            linear_int8_gemm(M, K, N, x_i8, W.i8(), (int32_t*)output.data);
 
-            // In-place dequant: reads INT32 from output, writes F32 back to same buffer
             int8_gemm_dequant_cuda((const int32_t*)output.data, output.f32(),
-                                    x_scale.f32(),
-                                    W.quant_scales, W.quant_scales_dtype,
-                                    (const int8_t*)W.quant_zero_points,
-                                    need_rowsum ? x_rowsum.f32() : nullptr,
+                                    x_sc, W.quant_scales, W.quant_scales_dtype,
+                                    (const int8_t*)W.quant_zero_points, x_rs,
                                     (const float*)bias_data, (int)M, (int)N);
             return;
         }
 
         // Convert activation to BF16 (needed for dequant+cuBLAS BF16 fallback path)
+        // When input is F32 and smooth is present, fuse F32→BF16 + smooth division
+        // into a single pass (avoids intermediate BF16 buffer + second kernel launch).
         const __nv_bfloat16* x_bf16;
         Tensor x_conv;
-        if (x.dtype == DType::BF16) {
+        bool smooth_applied = false;
+        if (x.dtype == DType::F32 && W.quant_smooth) {
+            x_conv = Tensor::alloc_shape(x.ndim, x.shape, DType::BF16, true);
+            f32_to_bf16_smooth_cuda(x.f32(), W.quant_smooth, x_conv.bf16(), M, K);
+            x_bf16 = x_conv.bf16();
+            smooth_applied = true;
+        } else if (x.dtype == DType::BF16) {
             x_bf16 = x.bf16();
         } else if (x.dtype == DType::F32) {
             x_conv = Tensor::alloc_shape(x.ndim, x.shape, DType::BF16, true);
@@ -328,10 +367,11 @@ static void linear(const Tensor& x, const Tensor& W, const Tensor* bias, Tensor&
             exit(1);
         }
 
-        // SmoothQuant: divide activations by smooth factors before WMMA GEMM
+        // SmoothQuant: divide activations by smooth factors before BF16 GEMM
         // Identity: X @ W^T = (X/s) @ (s*W)^T — s*W is baked into quantized weights
+        // Skip if already fused into the F32→BF16 conversion above.
         Tensor x_smooth;
-        if (W.quant_smooth) {
+        if (W.quant_smooth && !smooth_applied) {
             x_smooth = Tensor::alloc({M, K}, DType::BF16, true);
             smooth_div_bf16_cuda(x_bf16, W.quant_smooth, x_smooth.bf16(), (int)M, (int)K);
             x_bf16 = x_smooth.bf16();
@@ -454,4 +494,52 @@ static void batched_matmul_Bt(const Tensor& A, const Tensor& B, Tensor& C) {
         C.data, CUDA_R_32F, N, strideC,
         batch,
         CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
+}
+
+// Quantize activations into persistent scratch buffers for INT8 TC GEMM path.
+// Returns QuantizedAct with pointers valid until next quantize_act call.
+static QuantizedAct quantize_act(const Tensor& x, const float* smooth, bool need_rowsum) {
+    int64_t M = x.numel() / x.shape[x.ndim - 1];
+    int64_t K = x.shape[x.ndim - 1];
+
+    QuantizedAct qa;
+    qa.M = M;
+    qa.K = K;
+    qa.x_int8 = ensure_act_int8_scratch(M * K);
+    qa.x_scale = ensure_act_scale_scratch(M);
+    qa.x_rowsum = need_rowsum ? ensure_act_rowsum_scratch(M) : nullptr;
+
+    if (x.dtype == DType::F32) {
+        quantize_activations_int8_cuda(x.f32(), qa.x_int8, qa.x_scale, qa.x_rowsum,
+                                        (int)M, (int)K, smooth, need_rowsum);
+    } else if (x.dtype == DType::BF16) {
+        quantize_activations_int8_cuda(x.bf16(), qa.x_int8, qa.x_scale, qa.x_rowsum,
+                                        (int)M, (int)K, smooth, need_rowsum);
+    } else {
+        Tensor x_conv = Tensor::alloc_shape(x.ndim, x.shape, DType::BF16, true);
+        fp16_to_bf16_cuda(x.fp16(), x_conv.bf16(), x.numel());
+        quantize_activations_int8_cuda(x_conv.bf16(), qa.x_int8, qa.x_scale, qa.x_rowsum,
+                                        (int)M, (int)K, smooth, need_rowsum);
+    }
+    return qa;
+}
+
+// INT8 TC GEMM + dequant with pre-quantized activations.
+static void linear_prequant(const QuantizedAct& qa, const Tensor& W,
+                             const Tensor* bias, Tensor& output) {
+    int64_t M = qa.M, K = qa.K;
+    int64_t N = W.shape[0];
+    assert(W.dtype == DType::INT8);
+    assert(W.shape[1] == K);
+
+    const void* bias_data = (bias && bias->on_gpu && bias->dtype == DType::F32) ? bias->data : nullptr;
+
+    linear_int8_gemm(M, K, N, qa.x_int8, W.i8(), (int32_t*)output.data);
+
+    bool need_rowsum = (W.quant_zero_points != nullptr);
+    int8_gemm_dequant_cuda((const int32_t*)output.data, output.f32(),
+                            qa.x_scale, W.quant_scales, W.quant_scales_dtype,
+                            (const int8_t*)W.quant_zero_points,
+                            need_rowsum ? qa.x_rowsum : nullptr,
+                            (const float*)bias_data, (int)M, (int)N);
 }

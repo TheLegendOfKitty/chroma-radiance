@@ -1440,9 +1440,34 @@ __global__ void quantize_activations_kernel(
     extern __shared__ char qsmem[];
     float* fdata = reinterpret_cast<float*>(qsmem);
 
-    // Pass 1: find per-row absmax (on smoothed values if smooth != nullptr)
+    // Pass 1: find per-row absmax with vectorized loads (4 elements per iteration)
+    // K%4==0 is guaranteed by the per-channel INT8 entry point.
     float local_max = 0.0f;
-    for (int k = threadIdx.x; k < K; k += blockDim.x) {
+    const int k4_limit = K & ~3;
+
+    if constexpr (__is_same(InputT, float)) {
+        for (int k = threadIdx.x * 4; k < k4_limit; k += blockDim.x * 4) {
+            float4 v = *reinterpret_cast<const float4*>(x_row + k);
+            if (smooth) {
+                v.x /= smooth[k]; v.y /= smooth[k+1]; v.z /= smooth[k+2]; v.w /= smooth[k+3];
+            }
+            local_max = fmaxf(local_max, fmaxf(fmaxf(fabsf(v.x), fabsf(v.y)),
+                                                fmaxf(fabsf(v.z), fabsf(v.w))));
+        }
+    } else {
+        for (int k = threadIdx.x * 4; k < k4_limit; k += blockDim.x * 4) {
+            __nv_bfloat162 v01 = *reinterpret_cast<const __nv_bfloat162*>(x_row + k);
+            __nv_bfloat162 v23 = *reinterpret_cast<const __nv_bfloat162*>(x_row + k + 2);
+            float f0 = __bfloat162float(v01.x), f1 = __bfloat162float(v01.y);
+            float f2 = __bfloat162float(v23.x), f3 = __bfloat162float(v23.y);
+            if (smooth) {
+                f0 /= smooth[k]; f1 /= smooth[k+1]; f2 /= smooth[k+2]; f3 /= smooth[k+3];
+            }
+            local_max = fmaxf(local_max, fmaxf(fmaxf(fabsf(f0), fabsf(f1)),
+                                                fmaxf(fabsf(f2), fabsf(f3))));
+        }
+    }
+    for (int k = k4_limit + threadIdx.x; k < K; k += blockDim.x) {
         float v;
         if constexpr (__is_same(InputT, __nv_bfloat16))
             v = __bfloat162float(x_row[k]);
@@ -1451,6 +1476,7 @@ __global__ void quantize_activations_kernel(
         if (smooth) v /= smooth[k];
         local_max = fmaxf(local_max, fabsf(v));
     }
+
     fdata[threadIdx.x] = local_max;
     __syncthreads();
     for (int s = blockDim.x / 2; s > 0; s >>= 1) {
@@ -1463,9 +1489,42 @@ __global__ void quantize_activations_kernel(
     if (threadIdx.x == 0) x_scale[row] = absmax / 127.0f;
     __syncthreads();
 
-    // Pass 2: quantize to INT8 (and accumulate row sum if needed for asymmetric dequant)
+    // Pass 2: quantize with vectorized loads and packed INT8 stores
     int local_sum = 0;
-    for (int k = threadIdx.x; k < K; k += blockDim.x) {
+
+    if constexpr (__is_same(InputT, float)) {
+        for (int k = threadIdx.x * 4; k < k4_limit; k += blockDim.x * 4) {
+            float4 v = *reinterpret_cast<const float4*>(x_row + k);
+            if (smooth) {
+                v.x /= smooth[k]; v.y /= smooth[k+1]; v.z /= smooth[k+2]; v.w /= smooth[k+3];
+            }
+            int q0 = max(-128, min(127, __float2int_rn(v.x * inv_scale)));
+            int q1 = max(-128, min(127, __float2int_rn(v.y * inv_scale)));
+            int q2 = max(-128, min(127, __float2int_rn(v.z * inv_scale)));
+            int q3 = max(-128, min(127, __float2int_rn(v.w * inv_scale)));
+            *reinterpret_cast<int32_t*>(out_row + k) =
+                (q0 & 0xFF) | ((q1 & 0xFF) << 8) | ((q2 & 0xFF) << 16) | ((q3 & 0xFF) << 24);
+            if constexpr (NEED_ROWSUM) local_sum += q0 + q1 + q2 + q3;
+        }
+    } else {
+        for (int k = threadIdx.x * 4; k < k4_limit; k += blockDim.x * 4) {
+            __nv_bfloat162 v01 = *reinterpret_cast<const __nv_bfloat162*>(x_row + k);
+            __nv_bfloat162 v23 = *reinterpret_cast<const __nv_bfloat162*>(x_row + k + 2);
+            float f0 = __bfloat162float(v01.x), f1 = __bfloat162float(v01.y);
+            float f2 = __bfloat162float(v23.x), f3 = __bfloat162float(v23.y);
+            if (smooth) {
+                f0 /= smooth[k]; f1 /= smooth[k+1]; f2 /= smooth[k+2]; f3 /= smooth[k+3];
+            }
+            int q0 = max(-128, min(127, __float2int_rn(f0 * inv_scale)));
+            int q1 = max(-128, min(127, __float2int_rn(f1 * inv_scale)));
+            int q2 = max(-128, min(127, __float2int_rn(f2 * inv_scale)));
+            int q3 = max(-128, min(127, __float2int_rn(f3 * inv_scale)));
+            *reinterpret_cast<int32_t*>(out_row + k) =
+                (q0 & 0xFF) | ((q1 & 0xFF) << 8) | ((q2 & 0xFF) << 16) | ((q3 & 0xFF) << 24);
+            if constexpr (NEED_ROWSUM) local_sum += q0 + q1 + q2 + q3;
+        }
+    }
+    for (int k = k4_limit + threadIdx.x; k < K; k += blockDim.x) {
         float v;
         if constexpr (__is_same(InputT, __nv_bfloat16))
             v = __bfloat162float(x_row[k]);
@@ -2112,6 +2171,32 @@ void smooth_div_bf16_cuda(const __nv_bfloat16* X, const float* smooth,
     int total = M * K;
     int blocks = (total + threads - 1) / threads;
     smooth_div_bf16_kernel<<<blocks, threads>>>(X, smooth, out, M, K);
+}
+
+// ============================================================================
+// Fused F32→BF16 + smooth division: out[i] = bf16(src[i] / smooth[i % K])
+// Replaces separate f32_to_bf16 + smooth_div_bf16 (2 passes → 1 pass).
+// Each element computes its own column index to handle row boundaries safely.
+// ============================================================================
+
+__global__ void f32_to_bf16_smooth_kernel(
+    const float* __restrict__ src,
+    const float* __restrict__ smooth,
+    __nv_bfloat16* __restrict__ dst,
+    int64_t total, int64_t K)
+{
+    int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total) return;
+    int64_t k = idx % K;
+    dst[idx] = __float2bfloat16(src[idx] / smooth[k]);
+}
+
+void f32_to_bf16_smooth_cuda(const float* src, const float* smooth,
+                              __nv_bfloat16* dst, int64_t M, int64_t K) {
+    int threads = 256;
+    int64_t total = M * K;
+    int blocks = (int)((total + threads - 1) / threads);
+    f32_to_bf16_smooth_kernel<<<blocks, threads>>>(src, smooth, dst, total, K);
 }
 
 // ============================================================================

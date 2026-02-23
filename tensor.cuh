@@ -484,6 +484,11 @@ void fused_dequant_gemm_cuda(const __nv_bfloat16* X, const int8_t* W,
 void smooth_div_bf16_cuda(const __nv_bfloat16* X, const float* smooth,
                            __nv_bfloat16* out, int M, int K);
 
+// Fused F32→BF16 + smooth division: out[i] = bf16(src[i] / smooth[i % K])
+// Replaces separate f32_to_bf16 + smooth_div_bf16 (2 passes → 1 pass)
+void f32_to_bf16_smooth_cuda(const float* src, const float* smooth,
+                              __nv_bfloat16* dst, int64_t M, int64_t K);
+
 // Calibration: accumulate per-column absmax of BF16 activation matrix
 void calibrate_act_absmax_cuda(const __nv_bfloat16* X, float* accum, int M, int K);
 

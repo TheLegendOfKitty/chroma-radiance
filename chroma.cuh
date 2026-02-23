@@ -559,8 +559,14 @@ struct ChromaRadiance {
         Tensor ik_b = Tensor::wrap_gpu(w.img_qkv_b.f32() + hidden_size, {(int64_t)hidden_size}, DType::F32);
         Tensor iv_b = Tensor::wrap_gpu(w.img_qkv_b.f32() + 2 * hidden_size, {(int64_t)hidden_size}, DType::F32);
 
-        {
-            // Shared BF16 conversion for Q/K/V (works for both BF16 and INT8 weights)
+        if (iq_w.dtype == DType::INT8 && iq_w.quant_group_size >= (int)iq_w.shape[1]
+            && iq_w.shape[1] % 4 == 0) {
+            QuantizedAct qa = quantize_act(img_mod, iq_w.quant_smooth,
+                                            iq_w.quant_zero_points != nullptr);
+            linear_prequant(qa, iq_w, &iq_b, img_q_view);
+            linear_prequant(qa, ik_w, &ik_b, img_k_view);
+            linear_prequant(qa, iv_w, &iv_b, img_v_view);
+        } else {
             Tensor img_mod_bf16 = Tensor::alloc({img_tokens, (int64_t)hidden_size}, DType::BF16, true);
             f32_to_bf16_cuda(img_mod.f32(), img_mod_bf16.bf16(), img_mod.numel());
             linear(img_mod_bf16, iq_w, &iq_b, img_q_view);
@@ -584,7 +590,14 @@ struct ChromaRadiance {
         Tensor tk_b = Tensor::wrap_gpu(w.txt_qkv_b.f32() + hidden_size, {(int64_t)hidden_size}, DType::F32);
         Tensor tv_b = Tensor::wrap_gpu(w.txt_qkv_b.f32() + 2 * hidden_size, {(int64_t)hidden_size}, DType::F32);
 
-        {
+        if (tq_w.dtype == DType::INT8 && tq_w.quant_group_size >= (int)tq_w.shape[1]
+            && tq_w.shape[1] % 4 == 0) {
+            QuantizedAct qa = quantize_act(txt_mod_t, tq_w.quant_smooth,
+                                            tq_w.quant_zero_points != nullptr);
+            linear_prequant(qa, tq_w, &tq_b, txt_q_view);
+            linear_prequant(qa, tk_w, &tk_b, txt_k_view);
+            linear_prequant(qa, tv_w, &tv_b, txt_v_view);
+        } else {
             Tensor txt_mod_bf16 = Tensor::alloc({txt_tokens, (int64_t)hidden_size}, DType::BF16, true);
             f32_to_bf16_cuda(txt_mod_t.f32(), txt_mod_bf16.bf16(), txt_mod_t.numel());
             linear(txt_mod_bf16, tq_w, &tq_b, txt_q_view);
@@ -701,8 +714,15 @@ struct ChromaRadiance {
         Tensor v_t = Tensor::alloc({L, (int64_t)hidden_size}, DType::F32, true);
         Tensor mlp_t = Tensor::alloc({L, (int64_t)mlp_hidden}, DType::F32, true);
 
-        {
-            // Shared BF16 conversion for Q/K/V/MLP (works for both BF16 and INT8 weights)
+        if (sq_w.dtype == DType::INT8 && sq_w.quant_group_size >= (int)sq_w.shape[1]
+            && sq_w.shape[1] % 4 == 0) {
+            QuantizedAct qa = quantize_act(x_mod, sq_w.quant_smooth,
+                                            sq_w.quant_zero_points != nullptr);
+            linear_prequant(qa, sq_w, &sq_b, q_t);
+            linear_prequant(qa, sk_w, &sk_b, k_t);
+            linear_prequant(qa, sv_w, &sv_b, v_t);
+            linear_prequant(qa, sm_w, &sm_b, mlp_t);
+        } else {
             Tensor x_mod_bf16 = Tensor::alloc({L, (int64_t)hidden_size}, DType::BF16, true);
             f32_to_bf16_cuda(x_mod.f32(), x_mod_bf16.bf16(), x_mod.numel());
             linear(x_mod_bf16, sq_w, &sq_b, q_t);
