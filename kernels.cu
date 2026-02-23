@@ -2073,6 +2073,258 @@ void int8_gemm_dequant_gelu_cuda(const int32_t* Y_i32, float* Y_out,
 }
 
 // ============================================================================
+// Fused INT8 GEMM dequant + gated residual
+// out[m,n] = residual[m,n] + gate[n] * (x_scale[m] * w_scale[n] * (Y_i32[m,n] - zp[n]*x_rowsum[m]) + bias[n])
+// Eliminates F32 intermediate between dequant and gated_residual.
+// ============================================================================
+
+template<bool HAS_ZP>
+__global__ void int8_gemm_dequant_gated_residual_kernel(
+    const int32_t* __restrict__ Y_i32,        // [M, N] INT32 from GEMM
+    const float* __restrict__ residual,       // [M, N] F32 residual input
+    const float* __restrict__ gate,           // [N] F32 gate vector
+    float* __restrict__ out,                  // [M, N] F32 output (can alias residual)
+    const float* __restrict__ x_scale,        // [M]
+    const void* __restrict__ w_scale,         // [N] F32/FP16/BF16
+    int w_scale_dtype,
+    const int8_t* __restrict__ zp,            // [N] or nullptr (only read when HAS_ZP)
+    const float* __restrict__ x_rowsum,       // [M] or nullptr (only read when HAS_ZP)
+    const float* __restrict__ bias,           // [N] or nullptr
+    int M, int N)
+{
+    int64_t total = (int64_t)M * N;
+    int64_t vid = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    int64_t base = vid * 4;
+    if (base >= total) return;
+
+    int m = (int)(base / N);
+    int n = (int)(base % N);
+
+    // Vectorized path: all 4 elements in the same row and within bounds
+    if (n + 3 < N && base + 3 < total) {
+        int4 raw4 = *reinterpret_cast<const int4*>(Y_i32 + base);
+        float4 res4 = *reinterpret_cast<const float4*>(residual + base);
+        float xs = x_scale[m];
+
+        float ws0 = load_quant_scale_device(w_scale, w_scale_dtype, (int64_t)n);
+        float ws1 = load_quant_scale_device(w_scale, w_scale_dtype, (int64_t)(n + 1));
+        float ws2 = load_quant_scale_device(w_scale, w_scale_dtype, (int64_t)(n + 2));
+        float ws3 = load_quant_scale_device(w_scale, w_scale_dtype, (int64_t)(n + 3));
+
+        float g0 = gate[n], g1 = gate[n + 1], g2 = gate[n + 2], g3 = gate[n + 3];
+
+        float4 val;
+        if constexpr (HAS_ZP) {
+            float rowsum = x_rowsum[m];
+            val.x = xs * ws0 * ((float)raw4.x - (float)zp[n]     * rowsum);
+            val.y = xs * ws1 * ((float)raw4.y - (float)zp[n + 1] * rowsum);
+            val.z = xs * ws2 * ((float)raw4.z - (float)zp[n + 2] * rowsum);
+            val.w = xs * ws3 * ((float)raw4.w - (float)zp[n + 3] * rowsum);
+        } else {
+            val.x = xs * ws0 * (float)raw4.x;
+            val.y = xs * ws1 * (float)raw4.y;
+            val.z = xs * ws2 * (float)raw4.z;
+            val.w = xs * ws3 * (float)raw4.w;
+        }
+
+        if (bias) {
+            val.x += bias[n];     val.y += bias[n + 1];
+            val.z += bias[n + 2]; val.w += bias[n + 3];
+        }
+
+        float4 o;
+        o.x = res4.x + g0 * val.x;
+        o.y = res4.y + g1 * val.y;
+        o.z = res4.z + g2 * val.z;
+        o.w = res4.w + g3 * val.w;
+        *reinterpret_cast<float4*>(out + base) = o;
+    } else {
+        // Scalar fallback: row boundary or tail elements
+        for (int i = 0; i < 4; i++) {
+            int64_t idx = base + i;
+            if (idx >= total) break;
+            int mi = (int)(idx / N);
+            int ni = (int)(idx % N);
+            float raw = (float)Y_i32[idx];
+            float xs = x_scale[mi];
+            float ws = load_quant_scale_device(w_scale, w_scale_dtype, (int64_t)ni);
+            float correction = HAS_ZP ? (float)zp[ni] * x_rowsum[mi] : 0.0f;
+            float v = xs * ws * (raw - correction);
+            if (bias) v += bias[ni];
+            out[idx] = residual[idx] + gate[ni] * v;
+        }
+    }
+}
+
+void int8_gemm_dequant_gated_residual_cuda(
+    const int32_t* Y_i32, const float* residual, const float* gate, float* out,
+    const float* x_scale, const void* w_scale, DType w_scale_dtype,
+    const int8_t* zp, const float* x_rowsum,
+    const float* bias, int M, int N) {
+    int threads = 256;
+    int64_t total = (int64_t)M * N;
+    int64_t n_threads = (total + 3) / 4;
+    int blocks = (int)((n_threads + threads - 1) / threads);
+    if (zp) {
+        int8_gemm_dequant_gated_residual_kernel<true><<<blocks, threads>>>(
+            Y_i32, residual, gate, out, x_scale, w_scale, (int)w_scale_dtype,
+            zp, x_rowsum, bias, M, N);
+    } else {
+        int8_gemm_dequant_gated_residual_kernel<false><<<blocks, threads>>>(
+            Y_i32, residual, gate, out, x_scale, w_scale, (int)w_scale_dtype,
+            zp, x_rowsum, bias, M, N);
+    }
+}
+
+// ============================================================================
+// Fused concat last dim + INT8 quantize
+// Reads F32 a[M, Da] and F32 b[M, Db], quantizes to INT8 [M, Da+Db]
+// Eliminates BF16 intermediate in single-stream concat → linear2 path.
+// ============================================================================
+
+template<bool NEED_ROWSUM>
+__global__ void concat_quantize_int8_kernel(
+    const float* __restrict__ a,         // [M, Da]
+    const float* __restrict__ b,         // [M, Db]
+    const float* __restrict__ smooth,    // [Da+Db] or nullptr
+    int8_t* __restrict__ X_int8,         // [M, Da+Db]
+    float* __restrict__ x_scale,         // [M]
+    float* __restrict__ x_rowsum,        // [M] (only written when NEED_ROWSUM)
+    int M, int Da, int Db)
+{
+    int row = blockIdx.x;
+    if (row >= M) return;
+    int D = Da + Db;
+    const float* a_row = a + (int64_t)row * Da;
+    const float* b_row = b + (int64_t)row * Db;
+    int8_t* out_row = X_int8 + (int64_t)row * D;
+
+    extern __shared__ float cq_sdata[];
+
+    // Pass 1: find absmax across concatenated [Da+Db] vector
+    // Process a region [0, Da) with vectorized float4 loads
+    float local_max = 0.0f;
+    const int da4 = Da & ~3;
+    const int db4 = Db & ~3;
+
+    for (int k = threadIdx.x * 4; k < da4; k += blockDim.x * 4) {
+        float4 v = *reinterpret_cast<const float4*>(a_row + k);
+        if (smooth) {
+            v.x /= smooth[k]; v.y /= smooth[k+1]; v.z /= smooth[k+2]; v.w /= smooth[k+3];
+        }
+        local_max = fmaxf(local_max, fmaxf(fmaxf(fabsf(v.x), fabsf(v.y)),
+                                            fmaxf(fabsf(v.z), fabsf(v.w))));
+    }
+    for (int k = da4 + threadIdx.x; k < Da; k += blockDim.x) {
+        float v = a_row[k];
+        if (smooth) v /= smooth[k];
+        local_max = fmaxf(local_max, fabsf(v));
+    }
+    // Process b region [Da, D)
+    for (int k = threadIdx.x * 4; k < db4; k += blockDim.x * 4) {
+        float4 v = *reinterpret_cast<const float4*>(b_row + k);
+        int sk = Da + k;
+        if (smooth) {
+            v.x /= smooth[sk]; v.y /= smooth[sk+1]; v.z /= smooth[sk+2]; v.w /= smooth[sk+3];
+        }
+        local_max = fmaxf(local_max, fmaxf(fmaxf(fabsf(v.x), fabsf(v.y)),
+                                            fmaxf(fabsf(v.z), fabsf(v.w))));
+    }
+    for (int k = db4 + threadIdx.x; k < Db; k += blockDim.x) {
+        float v = b_row[k];
+        if (smooth) v /= smooth[Da + k];
+        local_max = fmaxf(local_max, fabsf(v));
+    }
+
+    cq_sdata[threadIdx.x] = local_max;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < (unsigned)s)
+            cq_sdata[threadIdx.x] = fmaxf(cq_sdata[threadIdx.x], cq_sdata[threadIdx.x + s]);
+        __syncthreads();
+    }
+    float absmax = cq_sdata[0];
+    float inv_scale = (absmax > 1e-10f) ? 127.0f / absmax : 0.0f;
+    if (threadIdx.x == 0) x_scale[row] = absmax / 127.0f;
+    __syncthreads();
+
+    // Pass 2: quantize and write INT8
+    int local_sum = 0;
+
+    // Quantize a region
+    for (int k = threadIdx.x * 4; k < da4; k += blockDim.x * 4) {
+        float4 v = *reinterpret_cast<const float4*>(a_row + k);
+        if (smooth) {
+            v.x /= smooth[k]; v.y /= smooth[k+1]; v.z /= smooth[k+2]; v.w /= smooth[k+3];
+        }
+        int q0 = max(-128, min(127, __float2int_rn(v.x * inv_scale)));
+        int q1 = max(-128, min(127, __float2int_rn(v.y * inv_scale)));
+        int q2 = max(-128, min(127, __float2int_rn(v.z * inv_scale)));
+        int q3 = max(-128, min(127, __float2int_rn(v.w * inv_scale)));
+        *reinterpret_cast<int32_t*>(out_row + k) =
+            (q0 & 0xFF) | ((q1 & 0xFF) << 8) | ((q2 & 0xFF) << 16) | ((q3 & 0xFF) << 24);
+        if constexpr (NEED_ROWSUM) local_sum += q0 + q1 + q2 + q3;
+    }
+    for (int k = da4 + threadIdx.x; k < Da; k += blockDim.x) {
+        float v = a_row[k];
+        if (smooth) v /= smooth[k];
+        int q = max(-128, min(127, __float2int_rn(v * inv_scale)));
+        out_row[k] = (int8_t)q;
+        if constexpr (NEED_ROWSUM) local_sum += q;
+    }
+
+    // Quantize b region (output offset by Da)
+    for (int k = threadIdx.x * 4; k < db4; k += blockDim.x * 4) {
+        float4 v = *reinterpret_cast<const float4*>(b_row + k);
+        int sk = Da + k;
+        if (smooth) {
+            v.x /= smooth[sk]; v.y /= smooth[sk+1]; v.z /= smooth[sk+2]; v.w /= smooth[sk+3];
+        }
+        int q0 = max(-128, min(127, __float2int_rn(v.x * inv_scale)));
+        int q1 = max(-128, min(127, __float2int_rn(v.y * inv_scale)));
+        int q2 = max(-128, min(127, __float2int_rn(v.z * inv_scale)));
+        int q3 = max(-128, min(127, __float2int_rn(v.w * inv_scale)));
+        *reinterpret_cast<int32_t*>(out_row + sk) =
+            (q0 & 0xFF) | ((q1 & 0xFF) << 8) | ((q2 & 0xFF) << 16) | ((q3 & 0xFF) << 24);
+        if constexpr (NEED_ROWSUM) local_sum += q0 + q1 + q2 + q3;
+    }
+    for (int k = db4 + threadIdx.x; k < Db; k += blockDim.x) {
+        float v = b_row[k];
+        if (smooth) v /= smooth[Da + k];
+        int q = max(-128, min(127, __float2int_rn(v * inv_scale)));
+        out_row[Da + k] = (int8_t)q;
+        if constexpr (NEED_ROWSUM) local_sum += q;
+    }
+
+    if constexpr (NEED_ROWSUM) {
+        int* idata = reinterpret_cast<int*>(cq_sdata);
+        idata[threadIdx.x] = local_sum;
+        __syncthreads();
+        for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+            if (threadIdx.x < (unsigned)s)
+                idata[threadIdx.x] += idata[threadIdx.x + s];
+            __syncthreads();
+        }
+        if (threadIdx.x == 0) x_rowsum[row] = (float)idata[0];
+    }
+}
+
+void concat_quantize_int8_cuda(const float* a, const float* b,
+                                const float* smooth,
+                                int8_t* X_int8, float* x_scale, float* x_rowsum,
+                                int M, int Da, int Db, bool need_rowsum) {
+    int threads = 256;
+    size_t smem_bytes = threads * sizeof(float);
+    if (need_rowsum) {
+        concat_quantize_int8_kernel<true><<<M, threads, smem_bytes>>>(
+            a, b, smooth, X_int8, x_scale, x_rowsum, M, Da, Db);
+    } else {
+        concat_quantize_int8_kernel<false><<<M, threads, smem_bytes>>>(
+            a, b, smooth, X_int8, x_scale, x_rowsum, M, Da, Db);
+    }
+}
+
+// ============================================================================
 // Fused INT8 Dequant + BF16 WMMA GEMM
 // Y[M,N] = X[M,K] @ W[N,K]^T + bias[N]
 //

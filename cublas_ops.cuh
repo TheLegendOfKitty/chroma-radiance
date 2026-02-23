@@ -40,6 +40,17 @@ void int8_dequant_gelu_quantize_cuda(
     int M, int N, bool need_rowsum);
 void calibrate_act_absmax_cuda(const __nv_bfloat16* X, float* accum, int M, int K);
 void f32_to_fp16_cuda(const float* src, __half* dst, int64_t n);
+void gated_residual_cuda(const float* x, const float* y, const float* gate,
+                         float* out, int64_t M, int64_t C);
+void int8_gemm_dequant_gated_residual_cuda(
+    const int32_t* Y_i32, const float* residual, const float* gate, float* out,
+    const float* x_scale, const void* w_scale, DType w_scale_dtype,
+    const int8_t* zp, const float* x_rowsum,
+    const float* bias, int M, int N);
+void concat_quantize_int8_cuda(const float* a, const float* b,
+                                const float* smooth,
+                                int8_t* X_int8, float* x_scale, float* x_rowsum,
+                                int M, int Da, int Db, bool need_rowsum);
 
 #define CHECK_CUBLAS(call) do { \
     cublasStatus_t err = (call); \
@@ -67,6 +78,10 @@ static float* g_act_scale_scratch = nullptr;
 static size_t g_act_scale_scratch_elems = 0;
 static float* g_act_rowsum_scratch = nullptr;
 static size_t g_act_rowsum_scratch_elems = 0;
+
+// Persistent scratch buffer for INT32 GEMM output (used by fused dequant+gated_residual)
+static int32_t* g_gemm_i32_scratch = nullptr;
+static size_t g_gemm_i32_scratch_elems = 0;
 
 // Algorithm cache: avoid repeated heuristic lookups for the same (M,N,K,types) combo
 struct LtAlgoKey {
@@ -153,6 +168,14 @@ static float* ensure_act_rowsum_scratch(int64_t elems) {
     CHECK_CUDA(cudaMalloc(&g_act_rowsum_scratch, elems * sizeof(float)));
     g_act_rowsum_scratch_elems = (size_t)elems;
     return g_act_rowsum_scratch;
+}
+
+static int32_t* ensure_gemm_i32_scratch(int64_t elems) {
+    if (elems <= (int64_t)g_gemm_i32_scratch_elems) return g_gemm_i32_scratch;
+    if (g_gemm_i32_scratch) CHECK_CUDA(cudaFree(g_gemm_i32_scratch));
+    CHECK_CUDA(cudaMalloc(&g_gemm_i32_scratch, elems * sizeof(int32_t)));
+    g_gemm_i32_scratch_elems = (size_t)elems;
+    return g_gemm_i32_scratch;
 }
 
 // Pre-quantized activation state for INT8 TC GEMM path.
@@ -505,7 +528,7 @@ static void batched_matmul(const Tensor& A, const Tensor& B, Tensor& C) {
         &beta,
         C.data, CUDA_R_32F, N, strideC,
         batch,
-        CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
+        CUBLAS_COMPUTE_32F_FAST_16BF, CUBLAS_GEMM_DEFAULT));
 }
 
 // Batched matmul with B transposed: C[b] = A[b] @ B[b]^T
@@ -536,7 +559,7 @@ static void batched_matmul_Bt(const Tensor& A, const Tensor& B, Tensor& C) {
         &beta,
         C.data, CUDA_R_32F, N, strideC,
         batch,
-        CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
+        CUBLAS_COMPUTE_32F_FAST_16BF, CUBLAS_GEMM_DEFAULT));
 }
 
 // Quantize activations into persistent scratch buffers for INT8 TC GEMM path.
@@ -608,6 +631,75 @@ static void linear_prequant_gelu(const QuantizedAct& qa, const Tensor& W,
                                  (const float*)bias_data, (int)M, (int)N);
 }
 
+// INT8 TC GEMM + fused dequant+gated_residual with pre-quantized activations.
+// out[m,n] = residual[m,n] + gate[n] * dequant(GEMM_output[m,n])
+// Uses INT32 scratch buffer for GEMM output to avoid clobbering residual.
+static void linear_prequant_gated_residual(const QuantizedAct& qa, const Tensor& W,
+                                            const Tensor* bias,
+                                            float* residual_inout, const float* gate,
+                                            int64_t M, int64_t N_out) {
+    int64_t K = qa.K;
+    assert(W.dtype == DType::INT8);
+    assert(W.shape[0] == N_out);
+    assert(W.shape[1] == K);
+
+    int32_t* Y_i32 = ensure_gemm_i32_scratch(M * N_out);
+    linear_int8_gemm(M, K, N_out, qa.x_int8, W.i8(), Y_i32);
+
+    const void* bias_data = (bias && bias->on_gpu && bias->dtype == DType::F32) ? bias->data : nullptr;
+    bool need_rowsum = (W.quant_zero_points != nullptr);
+
+    int8_gemm_dequant_gated_residual_cuda(
+        Y_i32, residual_inout, gate, residual_inout,
+        qa.x_scale, W.quant_scales, W.quant_scales_dtype,
+        need_rowsum ? (const int8_t*)W.quant_zero_points : nullptr,
+        need_rowsum ? qa.x_rowsum : nullptr,
+        (const float*)bias_data, (int)M, (int)N_out);
+}
+
+// Linear + fused gated residual: handles per-channel INT8 (fused dequant+gated_residual)
+// and falls back to separate linear + gated_residual for other dtypes.
+static void linear_gated_residual(const Tensor& x, const Tensor& W, const Tensor* bias,
+                                   float* residual_inout, const float* gate,
+                                   int64_t M, int64_t N_out) {
+    int64_t K = x.shape[x.ndim - 1];
+
+    if (W.dtype == DType::INT8 && W.quant_group_size >= (int)K && K % 4 == 0) {
+        // Per-channel INT8: quantize → GEMM → fused dequant+gated_residual
+        bool need_rowsum = (W.quant_zero_points != nullptr);
+        int8_t* x_i8 = ensure_act_int8_scratch(M * K);
+        float* x_sc = ensure_act_scale_scratch(M);
+        float* x_rs = need_rowsum ? ensure_act_rowsum_scratch(M) : nullptr;
+
+        if (x.dtype == DType::F32) {
+            quantize_activations_int8_cuda(x.f32(), x_i8, x_sc, x_rs,
+                                            (int)M, (int)K, W.quant_smooth, need_rowsum);
+        } else if (x.dtype == DType::BF16) {
+            quantize_activations_int8_cuda(x.bf16(), x_i8, x_sc, x_rs,
+                                            (int)M, (int)K, W.quant_smooth, need_rowsum);
+        } else {
+            fprintf(stderr, "Unsupported dtype for linear_gated_residual\n");
+            exit(1);
+        }
+
+        int32_t* Y_i32 = ensure_gemm_i32_scratch(M * N_out);
+        linear_int8_gemm(M, K, N_out, x_i8, W.i8(), Y_i32);
+
+        const void* bias_data = (bias && bias->on_gpu && bias->dtype == DType::F32) ? bias->data : nullptr;
+        int8_gemm_dequant_gated_residual_cuda(
+            Y_i32, residual_inout, gate, residual_inout,
+            x_sc, W.quant_scales, W.quant_scales_dtype,
+            need_rowsum ? (const int8_t*)W.quant_zero_points : nullptr,
+            need_rowsum ? x_rs : nullptr,
+            (const float*)bias_data, (int)M, (int)N_out);
+    } else {
+        // Non-INT8 or per-group: fallback to separate linear + gated_residual
+        Tensor output = Tensor::alloc({M, N_out}, DType::F32, true);
+        linear(x, W, bias, output);
+        gated_residual_cuda(residual_inout, output.f32(), gate, residual_inout, M, N_out);
+    }
+}
+
 // Fused modulate + INT8 activation quantization into persistent scratch buffers.
 // Replaces: modulate_cuda() → F32 buffer → quantize_activations_int8_cuda()
 // Returns QuantizedAct with pointers valid until next quantize_act/quantize_act_modulate call.
@@ -654,5 +746,24 @@ static QuantizedAct dequant_gelu_quantize(
         has_zp_prev ? qa_prev.x_rowsum : nullptr,
         (const float*)bias_data, smooth_next,
         (int)M, (int)N, need_rowsum_next);
+    return qa;
+}
+
+// Fused concat + INT8 quantize for single-stream concat → linear2 path.
+// Reads F32 a[M, Da] and F32 b[M, Db], outputs INT8 [M, Da+Db] with scales.
+static QuantizedAct concat_quantize_act(const float* a, const float* b,
+                                         int64_t M, int64_t Da, int64_t Db,
+                                         const float* smooth, bool need_rowsum) {
+    int64_t D = Da + Db;
+    QuantizedAct qa;
+    qa.M = M;
+    qa.K = D;
+    qa.x_int8 = ensure_act_int8_scratch(M * D);
+    qa.x_scale = ensure_act_scale_scratch(M);
+    qa.x_rowsum = need_rowsum ? ensure_act_rowsum_scratch(M) : nullptr;
+
+    concat_quantize_int8_cuda(a, b, smooth,
+                               qa.x_int8, qa.x_scale, qa.x_rowsum,
+                               (int)M, (int)Da, (int)Db, need_rowsum);
     return qa;
 }

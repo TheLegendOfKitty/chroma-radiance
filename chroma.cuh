@@ -640,9 +640,8 @@ struct ChromaRadiance {
                                             {img_tokens, (int64_t)hidden_size}, DType::F32);
 
         // === Image: proj + gated residual ===
-        Tensor img_attn_proj = linear_forward(img_attn, w.img_proj_w, &w.img_proj_b);
-        gated_residual_cuda(img.f32(), img_attn_proj.f32(), img_gate1,
-                            img.f32(), img_tokens, hidden_size);
+        linear_gated_residual(img_attn, w.img_proj_w, &w.img_proj_b,
+                               img.f32(), img_gate1, img_tokens, hidden_size);
 
         // Image MLP sublayer
         int64_t K_mlp = w.img_mlp_0_w.shape[1];
@@ -663,10 +662,8 @@ struct ChromaRadiance {
                 w.img_mlp_2_w.quant_smooth, w.img_mlp_2_w.quant_zero_points != nullptr,
                 img_tokens, mlp_hidden);
 
-            Tensor img_mlp_out = Tensor::alloc({img_tokens, (int64_t)hidden_size}, DType::F32, true);
-            linear_prequant(qa_mlp2, w.img_mlp_2_w, &w.img_mlp_2_b, img_mlp_out);
-            gated_residual_cuda(img.f32(), img_mlp_out.f32(), img_gate2,
-                                img.f32(), img_tokens, hidden_size);
+            linear_prequant_gated_residual(qa_mlp2, w.img_mlp_2_w, &w.img_mlp_2_b,
+                                            img.f32(), img_gate2, img_tokens, hidden_size);
         } else {
             // Per-group INT8 or BF16: fused modulate→BF16 + fused GELU→BF16
             Tensor img_mod2 = Tensor::alloc({img_tokens, (int64_t)hidden_size}, DType::BF16, true);
@@ -682,9 +679,8 @@ struct ChromaRadiance {
         }
 
         // === Text: proj + gated residual ===
-        Tensor txt_attn_proj = linear_forward(txt_attn, w.txt_proj_w, &w.txt_proj_b);
-        gated_residual_cuda(txt.f32(), txt_attn_proj.f32(), txt_gate1,
-                            txt.f32(), txt_tokens, hidden_size);
+        linear_gated_residual(txt_attn, w.txt_proj_w, &w.txt_proj_b,
+                               txt.f32(), txt_gate1, txt_tokens, hidden_size);
 
         // Text MLP sublayer
         int64_t K_mlp_txt = w.txt_mlp_0_w.shape[1];
@@ -705,10 +701,8 @@ struct ChromaRadiance {
                 w.txt_mlp_2_w.quant_smooth, w.txt_mlp_2_w.quant_zero_points != nullptr,
                 txt_tokens, mlp_hidden);
 
-            Tensor txt_mlp_out = Tensor::alloc({txt_tokens, (int64_t)hidden_size}, DType::F32, true);
-            linear_prequant(qa_mlp2, w.txt_mlp_2_w, &w.txt_mlp_2_b, txt_mlp_out);
-            gated_residual_cuda(txt.f32(), txt_mlp_out.f32(), txt_gate2,
-                                txt.f32(), txt_tokens, hidden_size);
+            linear_prequant_gated_residual(qa_mlp2, w.txt_mlp_2_w, &w.txt_mlp_2_b,
+                                            txt.f32(), txt_gate2, txt_tokens, hidden_size);
         } else {
             // Per-group INT8 or BF16: fused modulate→BF16 + fused GELU→BF16
             Tensor txt_mod2 = Tensor::alloc({txt_tokens, (int64_t)hidden_size}, DType::BF16, true);
@@ -816,18 +810,25 @@ struct ChromaRadiance {
 
         Tensor attn_out = attention_with_rope(q_r, k_r, v_r, pe, num_heads, d_head, attn_mask);
 
-        // Fused concat → BF16: concatenate attn(3072) + GELU'd mlp(12288), output BF16
-        // Eliminates separate concat + f32_to_bf16 conversion before linear2
+        // Concat attn + MLP, then linear2 + gated residual
         int64_t concat_dim = hidden_size + mlp_hidden;
-        Tensor attn_mlp = Tensor::alloc({L, concat_dim}, DType::BF16, true);
-        concat_last_dim_to_bf16_cuda(attn_out.f32(), mlp_t.f32(), attn_mlp.bf16(),
-                                      L, hidden_size, mlp_hidden);
-
-        // linear2: [L, 3072]
-        Tensor output = linear_forward(attn_mlp, w.linear2_w, &w.linear2_b);
-
-        // Gated residual
-        gated_residual_cuda(x.f32(), output.f32(), gate, x.f32(), L, hidden_size);
+        if (w.linear2_w.dtype == DType::INT8
+            && w.linear2_w.quant_group_size >= (int)w.linear2_w.shape[1]
+            && w.linear2_w.shape[1] % 4 == 0) {
+            // Per-channel INT8: fused concat+quantize → GEMM → fused dequant+gated_residual
+            QuantizedAct qa_concat = concat_quantize_act(
+                attn_out.f32(), mlp_t.f32(), L, hidden_size, mlp_hidden,
+                w.linear2_w.quant_smooth, w.linear2_w.quant_zero_points != nullptr);
+            linear_prequant_gated_residual(qa_concat, w.linear2_w, &w.linear2_b,
+                                            x.f32(), gate, L, hidden_size);
+        } else {
+            // Per-group INT8 or BF16: concat→BF16 + linear + gated_residual
+            Tensor attn_mlp = Tensor::alloc({L, concat_dim}, DType::BF16, true);
+            concat_last_dim_to_bf16_cuda(attn_out.f32(), mlp_t.f32(), attn_mlp.bf16(),
+                                          L, hidden_size, mlp_hidden);
+            Tensor output = linear_forward(attn_mlp, w.linear2_w, &w.linear2_b);
+            gated_residual_cuda(x.f32(), output.f32(), gate, x.f32(), L, hidden_size);
+        }
     }
 
     // ======================================================================
