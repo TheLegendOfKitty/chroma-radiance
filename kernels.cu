@@ -2138,3 +2138,36 @@ void calibrate_act_absmax_cuda(const __nv_bfloat16* X, float* accum, int M, int 
     int blocks = (K + threads - 1) / threads;
     calibrate_act_absmax_kernel<<<blocks, threads>>>(X, accum, M, K);
 }
+
+// ============================================================================
+// Permute + F32→BF16: [L, n_head, d_head] F32 → [n_head, L, d_head] BF16
+// Simple element-wise kernel for V preparation before flash attention.
+// ============================================================================
+
+__global__ void permute_and_convert_to_bf16_kernel(
+    const float* __restrict__ src,       // [L, n_head, d_head] F32
+    __nv_bfloat16* __restrict__ dst,     // [n_head, L, d_head] BF16
+    int n_head, int L, int d_head)
+{
+    int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    int64_t total = (int64_t)n_head * L * d_head;
+    if (idx >= total) return;
+
+    // Decode output index: dst[h, l, d]
+    int d = (int)(idx % d_head);
+    int64_t rem = idx / d_head;
+    int l = (int)(rem % L);
+    int h = (int)(rem / L);
+
+    // Read from src[l, h, d]
+    int64_t src_idx = (int64_t)l * n_head * d_head + h * d_head + d;
+    dst[idx] = __float2bfloat16(src[src_idx]);
+}
+
+void permute_and_convert_to_bf16_cuda(const float* src, __nv_bfloat16* dst,
+                                       int n_head, int L, int d_head) {
+    int64_t total = (int64_t)n_head * L * d_head;
+    int threads = 256;
+    int blocks = (int)((total + threads - 1) / threads);
+    permute_and_convert_to_bf16_kernel<<<blocks, threads>>>(src, dst, n_head, L, d_head);
+}

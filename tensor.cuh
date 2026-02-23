@@ -487,6 +487,10 @@ void smooth_div_bf16_cuda(const __nv_bfloat16* X, const float* smooth,
 // Calibration: accumulate per-column absmax of BF16 activation matrix
 void calibrate_act_absmax_cuda(const __nv_bfloat16* X, float* accum, int M, int K);
 
+// Permute + F32→BF16: [L, n_head, d_head] F32 → [n_head, L, d_head] BF16
+void permute_and_convert_to_bf16_cuda(const float* src, __nv_bfloat16* dst,
+                                       int n_head, int L, int d_head);
+
 static inline Tensor to_f32_gpu(const Tensor& t) {
     if (t.dtype == DType::F32) return t.to_gpu();
     assert(t.on_gpu && t.is_contiguous());

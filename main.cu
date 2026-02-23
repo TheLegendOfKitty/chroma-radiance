@@ -236,6 +236,7 @@ int main(int argc, char** argv) {
     printf("GPU: %s (%.1f GB)\n", prop.name, prop.totalGlobalMem / 1e9);
 
     init_cublas();
+    init_cudnn();
 
     auto t0 = std::chrono::high_resolution_clock::now();
 

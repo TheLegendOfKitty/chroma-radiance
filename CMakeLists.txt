@@ -12,15 +12,18 @@ endif()
 # Main executable
 add_executable(chroma-radiance main.cu)
 
-target_include_directories(chroma-radiance PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_include_directories(chroma-radiance PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/cudnn-frontend/include
+)
 
-# cuBLAS
+# cuBLAS + cuDNN
 find_package(CUDAToolkit REQUIRED)
 
 # libpng
 find_package(PNG REQUIRED)
 
-target_link_libraries(chroma-radiance PRIVATE CUDA::cublas CUDA::cublasLt CUDA::cudart PNG::PNG)
+target_link_libraries(chroma-radiance PRIVATE CUDA::cublas CUDA::cublasLt CUDA::cudart PNG::PNG cudnn)
 
 # Optimization flags
 target_compile_options(chroma-radiance PRIVATE
