@@ -1514,16 +1514,55 @@ void dequant_int8_to_bf16_vec_cuda(const int8_t* src, const void* scales, DType 
 }
 
 // ============================================================================
+// In-place block-diagonal Walsh-Hadamard Transform (WHT) on shared memory.
+// Applies WHT to each block of block_size elements in smem[0..dim-1].
+// block_size must be a power of 2. dim = block_size * num_blocks.
+// Normalizes by 1/sqrt(block_size) so H @ H^T = I.
+// Requires __syncthreads() per butterfly stage (log2(block_size) stages).
+// ============================================================================
+
+__device__ void wht_inplace_smem(float* smem, int dim, int block_size, int num_blocks) {
+    float norm = rsqrtf((float)block_size);
+    int n_stages = __ffs(block_size) - 1;  // log2(block_size)
+    int pairs_per_block = block_size >> 1;
+    int total_pairs = num_blocks * pairs_per_block;
+
+    for (int stage = 0; stage < n_stages; stage++) {
+        int half = 1 << stage;
+        int span = half << 1;
+        for (int idx = threadIdx.x; idx < total_pairs; idx += blockDim.x) {
+            int block = idx / pairs_per_block;
+            int pair = idx % pairs_per_block;
+            int base = block * block_size;
+            int i = base + (pair / half) * span + (pair % half);
+            int j = i + half;
+            float a = smem[i], b = smem[j];
+            smem[i] = a + b;
+            smem[j] = a - b;
+        }
+        __syncthreads();
+    }
+    // Normalize
+    for (int i = threadIdx.x; i < dim; i += blockDim.x)
+        smem[i] *= norm;
+    __syncthreads();
+}
+
+// Global flag: set at model load time if weights were Hadamard-rotated offline
+bool g_hadamard_enabled = false;
+
+// ============================================================================
 // Dynamic INT8 activation quantization for INT8 GEMM path
 // Per-row symmetric: x_int8 = round(x * 127/absmax), x_scale = absmax/127
 // Also computes row sums of x_int8 for asymmetric weight dequant correction:
 //   Y[m,n] = x_scale[m] * w_scale[n] * (GEMM[m,n] - zp[n] * x_rowsum[m])
 // ============================================================================
 
-// Template on NEED_ROWSUM and InputT (float or __nv_bfloat16):
+// Template on NEED_ROWSUM, InputT (float or __nv_bfloat16), HADAMARD:
 // - NEED_ROWSUM=false skips integer rowsum accumulation + reduction (symmetric quantization)
 // - InputT=float avoids the f32→bf16 conversion kernel when activations are already F32
-template<bool NEED_ROWSUM, typename InputT>
+// - HADAMARD=true caches values in smem, applies block-diagonal WHT before quantization
+template<bool NEED_ROWSUM, typename InputT, bool HADAMARD = false>
 __global__ void quantize_activations_kernel(
     const InputT* __restrict__ X,          // [M, K]
     int8_t* __restrict__ X_int8,           // [M, K]
@@ -1538,146 +1577,250 @@ __global__ void quantize_activations_kernel(
     int8_t* out_row = X_int8 + (int64_t)row * K;
 
     extern __shared__ char qsmem[];
-    float* fdata = reinterpret_cast<float*>(qsmem);
-
-    // Pass 1: find per-row absmax with vectorized loads (4 elements per iteration)
-    // K%4==0 is guaranteed by the per-channel INT8 entry point.
-    float local_max = 0.0f;
     const int k4_limit = K & ~3;
 
-    if constexpr (__is_same(InputT, float)) {
-        for (int k = threadIdx.x * 4; k < k4_limit; k += blockDim.x * 4) {
-            float4 v = *reinterpret_cast<const float4*>(x_row + k);
-            if (smooth) {
-                v.x /= smooth[k]; v.y /= smooth[k+1]; v.z /= smooth[k+2]; v.w /= smooth[k+3];
-            }
-            local_max = fmaxf(local_max, fmaxf(fmaxf(fabsf(v.x), fabsf(v.y)),
-                                                fmaxf(fabsf(v.z), fabsf(v.w))));
-        }
-    } else {
-        for (int k = threadIdx.x * 4; k < k4_limit; k += blockDim.x * 4) {
-            __nv_bfloat162 v01 = *reinterpret_cast<const __nv_bfloat162*>(x_row + k);
-            __nv_bfloat162 v23 = *reinterpret_cast<const __nv_bfloat162*>(x_row + k + 2);
-            float f0 = __bfloat162float(v01.x), f1 = __bfloat162float(v01.y);
-            float f2 = __bfloat162float(v23.x), f3 = __bfloat162float(v23.y);
-            if (smooth) {
-                f0 /= smooth[k]; f1 /= smooth[k+1]; f2 /= smooth[k+2]; f3 /= smooth[k+3];
-            }
-            local_max = fmaxf(local_max, fmaxf(fmaxf(fabsf(f0), fabsf(f1)),
-                                                fmaxf(fabsf(f2), fabsf(f3))));
-        }
-    }
-    for (int k = k4_limit + threadIdx.x; k < K; k += blockDim.x) {
-        float v;
-        if constexpr (__is_same(InputT, __nv_bfloat16))
-            v = __bfloat162float(x_row[k]);
-        else
-            v = x_row[k];
-        if (smooth) v /= smooth[k];
-        local_max = fmaxf(local_max, fabsf(v));
-    }
+    if constexpr (HADAMARD) {
+        // HADAMARD path: load+smooth → cache in smem → WHT → absmax → quantize from smem
+        // smem layout: [K floats for cached values] [blockDim.x floats for reduction]
+        float* cached = reinterpret_cast<float*>(qsmem);
+        float* sdata = cached + K;
 
-    fdata[threadIdx.x] = local_max;
-    __syncthreads();
-    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (threadIdx.x < (unsigned)s)
-            fdata[threadIdx.x] = fmaxf(fdata[threadIdx.x], fdata[threadIdx.x + s]);
+        // Load + smooth → cache in smem
+        if constexpr (__is_same(InputT, float)) {
+            for (int k = threadIdx.x * 4; k < k4_limit; k += blockDim.x * 4) {
+                float4 v = *reinterpret_cast<const float4*>(x_row + k);
+                if (smooth) {
+                    v.x /= smooth[k]; v.y /= smooth[k+1]; v.z /= smooth[k+2]; v.w /= smooth[k+3];
+                }
+                cached[k] = v.x; cached[k+1] = v.y; cached[k+2] = v.z; cached[k+3] = v.w;
+            }
+        } else {
+            for (int k = threadIdx.x * 4; k < k4_limit; k += blockDim.x * 4) {
+                __nv_bfloat162 v01 = *reinterpret_cast<const __nv_bfloat162*>(x_row + k);
+                __nv_bfloat162 v23 = *reinterpret_cast<const __nv_bfloat162*>(x_row + k + 2);
+                float f0 = __bfloat162float(v01.x), f1 = __bfloat162float(v01.y);
+                float f2 = __bfloat162float(v23.x), f3 = __bfloat162float(v23.y);
+                if (smooth) {
+                    f0 /= smooth[k]; f1 /= smooth[k+1]; f2 /= smooth[k+2]; f3 /= smooth[k+3];
+                }
+                cached[k] = f0; cached[k+1] = f1; cached[k+2] = f2; cached[k+3] = f3;
+            }
+        }
+        for (int k = k4_limit + threadIdx.x; k < K; k += blockDim.x) {
+            float v;
+            if constexpr (__is_same(InputT, __nv_bfloat16))
+                v = __bfloat162float(x_row[k]);
+            else
+                v = x_row[k];
+            if (smooth) v /= smooth[k];
+            cached[k] = v;
+        }
         __syncthreads();
-    }
-    float absmax = fdata[0];
-    float inv_scale = (absmax > 1e-10f) ? 127.0f / absmax : 0.0f;
-    if (threadIdx.x == 0) x_scale[row] = absmax / 127.0f;
-    __syncthreads();
 
-    // Pass 2: quantize with vectorized loads and packed INT8 stores
-    int local_sum = 0;
+        // Apply block-diagonal WHT in smem
+        int block_size = K & (-K);  // largest power of 2 dividing K
+        int num_blocks_wht = K / block_size;
+        wht_inplace_smem(cached, K, block_size, num_blocks_wht);
 
-    if constexpr (__is_same(InputT, float)) {
-        for (int k = threadIdx.x * 4; k < k4_limit; k += blockDim.x * 4) {
-            float4 v = *reinterpret_cast<const float4*>(x_row + k);
-            if (smooth) {
-                v.x /= smooth[k]; v.y /= smooth[k+1]; v.z /= smooth[k+2]; v.w /= smooth[k+3];
-            }
-            int q0 = max(-128, min(127, __float2int_rn(v.x * inv_scale)));
-            int q1 = max(-128, min(127, __float2int_rn(v.y * inv_scale)));
-            int q2 = max(-128, min(127, __float2int_rn(v.z * inv_scale)));
-            int q3 = max(-128, min(127, __float2int_rn(v.w * inv_scale)));
-            *reinterpret_cast<int32_t*>(out_row + k) =
-                (q0 & 0xFF) | ((q1 & 0xFF) << 8) | ((q2 & 0xFF) << 16) | ((q3 & 0xFF) << 24);
-            if constexpr (NEED_ROWSUM) local_sum += q0 + q1 + q2 + q3;
-        }
-    } else {
-        for (int k = threadIdx.x * 4; k < k4_limit; k += blockDim.x * 4) {
-            __nv_bfloat162 v01 = *reinterpret_cast<const __nv_bfloat162*>(x_row + k);
-            __nv_bfloat162 v23 = *reinterpret_cast<const __nv_bfloat162*>(x_row + k + 2);
-            float f0 = __bfloat162float(v01.x), f1 = __bfloat162float(v01.y);
-            float f2 = __bfloat162float(v23.x), f3 = __bfloat162float(v23.y);
-            if (smooth) {
-                f0 /= smooth[k]; f1 /= smooth[k+1]; f2 /= smooth[k+2]; f3 /= smooth[k+3];
-            }
-            int q0 = max(-128, min(127, __float2int_rn(f0 * inv_scale)));
-            int q1 = max(-128, min(127, __float2int_rn(f1 * inv_scale)));
-            int q2 = max(-128, min(127, __float2int_rn(f2 * inv_scale)));
-            int q3 = max(-128, min(127, __float2int_rn(f3 * inv_scale)));
-            *reinterpret_cast<int32_t*>(out_row + k) =
-                (q0 & 0xFF) | ((q1 & 0xFF) << 8) | ((q2 & 0xFF) << 16) | ((q3 & 0xFF) << 24);
-            if constexpr (NEED_ROWSUM) local_sum += q0 + q1 + q2 + q3;
-        }
-    }
-    for (int k = k4_limit + threadIdx.x; k < K; k += blockDim.x) {
-        float v;
-        if constexpr (__is_same(InputT, __nv_bfloat16))
-            v = __bfloat162float(x_row[k]);
-        else
-            v = x_row[k];
-        if (smooth) v /= smooth[k];
-        int q = __float2int_rn(v * inv_scale);
-        q = max(-128, min(127, q));
-        out_row[k] = (int8_t)q;
-        if constexpr (NEED_ROWSUM) local_sum += q;
-    }
-
-    if constexpr (NEED_ROWSUM) {
-        int* idata = reinterpret_cast<int*>(qsmem);
-        idata[threadIdx.x] = local_sum;
+        // Find absmax from smem
+        float local_max = 0.0f;
+        for (int k = threadIdx.x; k < K; k += blockDim.x)
+            local_max = fmaxf(local_max, fabsf(cached[k]));
+        sdata[threadIdx.x] = local_max;
         __syncthreads();
         for (int s = blockDim.x / 2; s > 0; s >>= 1) {
             if (threadIdx.x < (unsigned)s)
-                idata[threadIdx.x] += idata[threadIdx.x + s];
+                sdata[threadIdx.x] = fmaxf(sdata[threadIdx.x], sdata[threadIdx.x + s]);
             __syncthreads();
         }
-        if (threadIdx.x == 0) x_rowsum[row] = (float)idata[0];
+        float absmax = sdata[0];
+        float inv_scale = (absmax > 1e-10f) ? 127.0f / absmax : 0.0f;
+        if (threadIdx.x == 0) x_scale[row] = absmax / 127.0f;
+        __syncthreads();
+
+        // Quantize from smem cache
+        int local_sum = 0;
+        for (int k = threadIdx.x * 4; k < k4_limit; k += blockDim.x * 4) {
+            int q0 = max(-128, min(127, __float2int_rn(cached[k]     * inv_scale)));
+            int q1 = max(-128, min(127, __float2int_rn(cached[k + 1] * inv_scale)));
+            int q2 = max(-128, min(127, __float2int_rn(cached[k + 2] * inv_scale)));
+            int q3 = max(-128, min(127, __float2int_rn(cached[k + 3] * inv_scale)));
+            *reinterpret_cast<int32_t*>(out_row + k) =
+                (q0 & 0xFF) | ((q1 & 0xFF) << 8) | ((q2 & 0xFF) << 16) | ((q3 & 0xFF) << 24);
+            if constexpr (NEED_ROWSUM) local_sum += q0 + q1 + q2 + q3;
+        }
+        for (int k = k4_limit + threadIdx.x; k < K; k += blockDim.x) {
+            int q = max(-128, min(127, __float2int_rn(cached[k] * inv_scale)));
+            out_row[k] = (int8_t)q;
+            if constexpr (NEED_ROWSUM) local_sum += q;
+        }
+
+        if constexpr (NEED_ROWSUM) {
+            int* idata = reinterpret_cast<int*>(sdata);
+            idata[threadIdx.x] = local_sum;
+            __syncthreads();
+            for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+                if (threadIdx.x < (unsigned)s)
+                    idata[threadIdx.x] += idata[threadIdx.x + s];
+                __syncthreads();
+            }
+            if (threadIdx.x == 0) x_rowsum[row] = (float)idata[0];
+        }
+    } else {
+        // Non-HADAMARD path: 2-pass recompute (existing code)
+        float* fdata = reinterpret_cast<float*>(qsmem);
+
+        // Pass 1: find per-row absmax with vectorized loads (4 elements per iteration)
+        // K%4==0 is guaranteed by the per-channel INT8 entry point.
+        float local_max = 0.0f;
+
+        if constexpr (__is_same(InputT, float)) {
+            for (int k = threadIdx.x * 4; k < k4_limit; k += blockDim.x * 4) {
+                float4 v = *reinterpret_cast<const float4*>(x_row + k);
+                if (smooth) {
+                    v.x /= smooth[k]; v.y /= smooth[k+1]; v.z /= smooth[k+2]; v.w /= smooth[k+3];
+                }
+                local_max = fmaxf(local_max, fmaxf(fmaxf(fabsf(v.x), fabsf(v.y)),
+                                                    fmaxf(fabsf(v.z), fabsf(v.w))));
+            }
+        } else {
+            for (int k = threadIdx.x * 4; k < k4_limit; k += blockDim.x * 4) {
+                __nv_bfloat162 v01 = *reinterpret_cast<const __nv_bfloat162*>(x_row + k);
+                __nv_bfloat162 v23 = *reinterpret_cast<const __nv_bfloat162*>(x_row + k + 2);
+                float f0 = __bfloat162float(v01.x), f1 = __bfloat162float(v01.y);
+                float f2 = __bfloat162float(v23.x), f3 = __bfloat162float(v23.y);
+                if (smooth) {
+                    f0 /= smooth[k]; f1 /= smooth[k+1]; f2 /= smooth[k+2]; f3 /= smooth[k+3];
+                }
+                local_max = fmaxf(local_max, fmaxf(fmaxf(fabsf(f0), fabsf(f1)),
+                                                    fmaxf(fabsf(f2), fabsf(f3))));
+            }
+        }
+        for (int k = k4_limit + threadIdx.x; k < K; k += blockDim.x) {
+            float v;
+            if constexpr (__is_same(InputT, __nv_bfloat16))
+                v = __bfloat162float(x_row[k]);
+            else
+                v = x_row[k];
+            if (smooth) v /= smooth[k];
+            local_max = fmaxf(local_max, fabsf(v));
+        }
+
+        fdata[threadIdx.x] = local_max;
+        __syncthreads();
+        for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+            if (threadIdx.x < (unsigned)s)
+                fdata[threadIdx.x] = fmaxf(fdata[threadIdx.x], fdata[threadIdx.x + s]);
+            __syncthreads();
+        }
+        float absmax = fdata[0];
+        float inv_scale = (absmax > 1e-10f) ? 127.0f / absmax : 0.0f;
+        if (threadIdx.x == 0) x_scale[row] = absmax / 127.0f;
+        __syncthreads();
+
+        // Pass 2: quantize with vectorized loads and packed INT8 stores
+        int local_sum = 0;
+
+        if constexpr (__is_same(InputT, float)) {
+            for (int k = threadIdx.x * 4; k < k4_limit; k += blockDim.x * 4) {
+                float4 v = *reinterpret_cast<const float4*>(x_row + k);
+                if (smooth) {
+                    v.x /= smooth[k]; v.y /= smooth[k+1]; v.z /= smooth[k+2]; v.w /= smooth[k+3];
+                }
+                int q0 = max(-128, min(127, __float2int_rn(v.x * inv_scale)));
+                int q1 = max(-128, min(127, __float2int_rn(v.y * inv_scale)));
+                int q2 = max(-128, min(127, __float2int_rn(v.z * inv_scale)));
+                int q3 = max(-128, min(127, __float2int_rn(v.w * inv_scale)));
+                *reinterpret_cast<int32_t*>(out_row + k) =
+                    (q0 & 0xFF) | ((q1 & 0xFF) << 8) | ((q2 & 0xFF) << 16) | ((q3 & 0xFF) << 24);
+                if constexpr (NEED_ROWSUM) local_sum += q0 + q1 + q2 + q3;
+            }
+        } else {
+            for (int k = threadIdx.x * 4; k < k4_limit; k += blockDim.x * 4) {
+                __nv_bfloat162 v01 = *reinterpret_cast<const __nv_bfloat162*>(x_row + k);
+                __nv_bfloat162 v23 = *reinterpret_cast<const __nv_bfloat162*>(x_row + k + 2);
+                float f0 = __bfloat162float(v01.x), f1 = __bfloat162float(v01.y);
+                float f2 = __bfloat162float(v23.x), f3 = __bfloat162float(v23.y);
+                if (smooth) {
+                    f0 /= smooth[k]; f1 /= smooth[k+1]; f2 /= smooth[k+2]; f3 /= smooth[k+3];
+                }
+                int q0 = max(-128, min(127, __float2int_rn(f0 * inv_scale)));
+                int q1 = max(-128, min(127, __float2int_rn(f1 * inv_scale)));
+                int q2 = max(-128, min(127, __float2int_rn(f2 * inv_scale)));
+                int q3 = max(-128, min(127, __float2int_rn(f3 * inv_scale)));
+                *reinterpret_cast<int32_t*>(out_row + k) =
+                    (q0 & 0xFF) | ((q1 & 0xFF) << 8) | ((q2 & 0xFF) << 16) | ((q3 & 0xFF) << 24);
+                if constexpr (NEED_ROWSUM) local_sum += q0 + q1 + q2 + q3;
+            }
+        }
+        for (int k = k4_limit + threadIdx.x; k < K; k += blockDim.x) {
+            float v;
+            if constexpr (__is_same(InputT, __nv_bfloat16))
+                v = __bfloat162float(x_row[k]);
+            else
+                v = x_row[k];
+            if (smooth) v /= smooth[k];
+            int q = __float2int_rn(v * inv_scale);
+            q = max(-128, min(127, q));
+            out_row[k] = (int8_t)q;
+            if constexpr (NEED_ROWSUM) local_sum += q;
+        }
+
+        if constexpr (NEED_ROWSUM) {
+            int* idata = reinterpret_cast<int*>(qsmem);
+            idata[threadIdx.x] = local_sum;
+            __syncthreads();
+            for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+                if (threadIdx.x < (unsigned)s)
+                    idata[threadIdx.x] += idata[threadIdx.x + s];
+                __syncthreads();
+            }
+            if (threadIdx.x == 0) x_rowsum[row] = (float)idata[0];
+        }
     }
 }
 
-// Launcher helper (dispatches NEED_ROWSUM × InputT template)
+// Launcher helper (dispatches NEED_ROWSUM × InputT × HADAMARD template)
 template<typename InputT>
 static void quantize_activations_dispatch(const InputT* X, int8_t* X_int8,
                                            float* x_scale, float* x_rowsum,
                                            int M, int K, const float* smooth,
-                                           bool need_rowsum) {
+                                           bool need_rowsum, bool hadamard) {
     int threads = 256;
-    if (need_rowsum) {
-        quantize_activations_kernel<true, InputT><<<M, threads, threads * sizeof(float)>>>(
-            X, X_int8, x_scale, x_rowsum, smooth, M, K);
+    if (hadamard) {
+        // HADAMARD: smem = K floats (cache) + 256 floats (reduction)
+        size_t smem_bytes = (K + threads) * sizeof(float);
+        if (need_rowsum) {
+            quantize_activations_kernel<true, InputT, true><<<M, threads, smem_bytes>>>(
+                X, X_int8, x_scale, x_rowsum, smooth, M, K);
+        } else {
+            quantize_activations_kernel<false, InputT, true><<<M, threads, smem_bytes>>>(
+                X, X_int8, x_scale, x_rowsum, smooth, M, K);
+        }
     } else {
-        quantize_activations_kernel<false, InputT><<<M, threads, threads * sizeof(float)>>>(
-            X, X_int8, x_scale, x_rowsum, smooth, M, K);
+        size_t smem_bytes = threads * sizeof(float);
+        if (need_rowsum) {
+            quantize_activations_kernel<true, InputT, false><<<M, threads, smem_bytes>>>(
+                X, X_int8, x_scale, x_rowsum, smooth, M, K);
+        } else {
+            quantize_activations_kernel<false, InputT, false><<<M, threads, smem_bytes>>>(
+                X, X_int8, x_scale, x_rowsum, smooth, M, K);
+        }
     }
 }
 
 void quantize_activations_int8_cuda(const __nv_bfloat16* X, int8_t* X_int8,
                                      float* x_scale, float* x_rowsum,
                                      int M, int K, const float* smooth,
-                                     bool need_rowsum) {
-    quantize_activations_dispatch(X, X_int8, x_scale, x_rowsum, M, K, smooth, need_rowsum);
+                                     bool need_rowsum, bool hadamard) {
+    quantize_activations_dispatch(X, X_int8, x_scale, x_rowsum, M, K, smooth, need_rowsum, hadamard);
 }
 
 void quantize_activations_int8_cuda(const float* X, int8_t* X_int8,
                                      float* x_scale, float* x_rowsum,
                                      int M, int K, const float* smooth,
-                                     bool need_rowsum) {
-    quantize_activations_dispatch(X, X_int8, x_scale, x_rowsum, M, K, smooth, need_rowsum);
+                                     bool need_rowsum, bool hadamard) {
+    quantize_activations_dispatch(X, X_int8, x_scale, x_rowsum, M, K, smooth, need_rowsum, hadamard);
 }
 
 // ============================================================================
@@ -1688,7 +1831,7 @@ void quantize_activations_int8_cuda(const float* X, int8_t* X_int8,
 // Uses shared memory to cache modulated values, avoiding an F32 intermediate.
 // ============================================================================
 
-template<bool NEED_ROWSUM>
+template<bool NEED_ROWSUM, bool HADAMARD = false>
 __global__ void modulate_quantize_int8_kernel(
     const float* __restrict__ x,           // [M, C]
     const float* __restrict__ shift,       // [C]
@@ -1737,15 +1880,26 @@ __global__ void modulate_quantize_int8_kernel(
     float inv_std = rsqrtf(sdata[0] / C + eps);
     __syncthreads();
 
-    // Pass 3: apply modulate + smooth, cache in smem, find absmax
-    float local_max = 0.0f;
+    // Pass 3: apply modulate + smooth, cache in smem
     for (int i = threadIdx.x; i < C; i += blockDim.x) {
         float normed = (xr[i] - mean) * inv_std;
         float val = normed * (1.0f + scale[i]) + shift[i];
         if (smooth) val /= smooth[i];
         cached[i] = val;
-        local_max = fmaxf(local_max, fabsf(val));
     }
+    __syncthreads();
+
+    // HADAMARD: apply block-diagonal WHT to cached values before quantization
+    if constexpr (HADAMARD) {
+        int block_size = C & (-C);  // largest power of 2 dividing C
+        int num_blocks_wht = C / block_size;
+        wht_inplace_smem(cached, C, block_size, num_blocks_wht);
+    }
+
+    // Find absmax from smem cache
+    float local_max = 0.0f;
+    for (int i = threadIdx.x; i < C; i += blockDim.x)
+        local_max = fmaxf(local_max, fabsf(cached[i]));
     sdata[threadIdx.x] = local_max;
     __syncthreads();
     for (int s = blockDim.x / 2; s > 0; s >>= 1) {
@@ -1792,16 +1946,27 @@ __global__ void modulate_quantize_int8_kernel(
 void modulate_quantize_int8_cuda(const float* x, const float* shift, const float* scale,
                                   const float* smooth,
                                   int8_t* X_int8, float* x_scale, float* x_rowsum,
-                                  int M, int C, float eps, bool need_rowsum) {
+                                  int M, int C, float eps, bool need_rowsum,
+                                  bool hadamard) {
     int threads = 256;
     // smem: C floats (cached modulated values) + 256 floats (reduction)
     size_t smem_bytes = (C + threads) * sizeof(float);
-    if (need_rowsum) {
-        modulate_quantize_int8_kernel<true><<<M, threads, smem_bytes>>>(
-            x, shift, scale, smooth, X_int8, x_scale, x_rowsum, M, C, eps);
+    if (hadamard) {
+        if (need_rowsum) {
+            modulate_quantize_int8_kernel<true, true><<<M, threads, smem_bytes>>>(
+                x, shift, scale, smooth, X_int8, x_scale, x_rowsum, M, C, eps);
+        } else {
+            modulate_quantize_int8_kernel<false, true><<<M, threads, smem_bytes>>>(
+                x, shift, scale, smooth, X_int8, x_scale, x_rowsum, M, C, eps);
+        }
     } else {
-        modulate_quantize_int8_kernel<false><<<M, threads, smem_bytes>>>(
-            x, shift, scale, smooth, X_int8, x_scale, x_rowsum, M, C, eps);
+        if (need_rowsum) {
+            modulate_quantize_int8_kernel<true, false><<<M, threads, smem_bytes>>>(
+                x, shift, scale, smooth, X_int8, x_scale, x_rowsum, M, C, eps);
+        } else {
+            modulate_quantize_int8_kernel<false, false><<<M, threads, smem_bytes>>>(
+                x, shift, scale, smooth, X_int8, x_scale, x_rowsum, M, C, eps);
+        }
     }
 }
 

@@ -54,7 +54,8 @@ void slice_columns_cuda(const float* src, float* dst,
 void modulate_quantize_int8_cuda(const float* x, const float* shift, const float* scale,
                                   const float* smooth,
                                   int8_t* X_int8, float* x_scale, float* x_rowsum,
-                                  int M, int C, float eps, bool need_rowsum);
+                                  int M, int C, float eps, bool need_rowsum,
+                                  bool hadamard);
 void int8_dequant_gelu_quantize_cuda(
     const int32_t* Y_i32, int8_t* X_int8_out,
     float* x_scale_out, float* x_rowsum_out,
@@ -384,6 +385,12 @@ struct ChromaRadiance {
                 is_int8 = true;
                 printf("  Detected INT8 quantized weights\n");
             }
+        }
+
+        // Detect Hadamard rotation from safetensors metadata
+        if (sf.metadata_get("quantization_hadamard") == "true") {
+            g_hadamard_enabled = true;
+            printf("  Hadamard rotation enabled\n");
         }
 
         // Small resident weights

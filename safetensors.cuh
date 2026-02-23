@@ -25,6 +25,12 @@ struct SafetensorsFile {
     size_t header_size = 0;
     const char* data_start = nullptr;
     std::unordered_map<std::string, TensorInfo> tensors;
+    std::unordered_map<std::string, std::string> metadata;
+
+    std::string metadata_get(const std::string& key) const {
+        auto it = metadata.find(key);
+        return (it != metadata.end()) ? it->second : "";
+    }
 
     ~SafetensorsFile() {
         if (mapped) munmap(mapped, file_size);
@@ -184,7 +190,24 @@ private:
             skip_ws();
 
             if (key == "__metadata__") {
-                skip_value();
+                // Parse metadata object: {"key": "value", ...}
+                if (pos < json.size() && json[pos] == '{') {
+                    pos++; // {
+                    skip_ws();
+                    while (pos < json.size() && json[pos] != '}') {
+                        std::string meta_key = parse_string();
+                        expect(':');
+                        skip_ws();
+                        std::string meta_val = parse_string();
+                        metadata[meta_key] = meta_val;
+                        skip_ws();
+                        if (json[pos] == ',') pos++;
+                        skip_ws();
+                    }
+                    pos++; // }
+                } else {
+                    skip_value();
+                }
             } else if (json[pos] == '{') {
                 // Tensor entry
                 pos++; // {

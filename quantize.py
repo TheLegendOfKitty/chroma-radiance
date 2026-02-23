@@ -16,6 +16,7 @@ Usage:
 """
 
 import argparse
+import math
 import time
 import torch
 import torch.nn.functional as F
@@ -50,6 +51,37 @@ def compute_smooth_factors(w: torch.Tensor, alpha: float = 0.5,
         # Weight-only fallback (not recommended)
         s = weight_absmax.pow(alpha)
     return s.clamp(min=1e-5)
+
+
+def hadamard_matrix(n: int) -> torch.Tensor:
+    """Normalized Walsh-Hadamard matrix of size n (must be power of 2).
+
+    Returns orthogonal H such that H @ H^T = I.
+    Constructed via Sylvester's recursive method with 1/sqrt(2) normalization
+    at each level so the final matrix is orthonormal.
+    """
+    H = torch.tensor([[1.0]])
+    while H.shape[0] < n:
+        H = torch.cat([torch.cat([H, H], 1),
+                        torch.cat([H, -H], 1)], 0) / math.sqrt(2)
+    return H
+
+
+def block_hadamard_rotate(w: torch.Tensor, K: int) -> torch.Tensor:
+    """Rotate W[N, K] with block-diagonal normalized Hadamard matrix.
+
+    Uses the largest power-of-2 block size that divides K.
+    For K=3072: block_size=1024, 3 blocks of H_1024.
+    Result: W_rot = W @ blkdiag(H, H, ..., H).
+    Since H is orthonormal, W_rot @ H^T = W (the rotation is reversible).
+    """
+    block_size = K & (-K)  # largest power of 2 dividing K
+    num_blocks = K // block_size
+    H = hadamard_matrix(block_size).to(w.device, w.dtype)  # [block_size, block_size]
+    # Reshape to [N, num_blocks, block_size], rotate each block, reshape back
+    W_blocks = w.reshape(-1, num_blocks, block_size)
+    W_rot = W_blocks @ H.T
+    return W_rot.reshape(-1, K)
 
 
 def compute_group_params(w: torch.Tensor, group_size: int, asymmetric: bool,
@@ -386,7 +418,7 @@ def quantize_weights(input_path: str, output_path: str, group_size: int = 128,
                      scale_dtype: str = "f32", asymmetric: bool = False,
                      smooth_alpha: float = 0.0, use_gptq: bool = False,
                      calib_path: str = "", use_awq: bool = False,
-                     clip_mode: str = "absmax") -> None:
+                     clip_mode: str = "absmax", hadamard: bool = False) -> None:
     print(f"Loading {input_path}...")
     tensors = load_file(input_path)
 
@@ -441,14 +473,23 @@ def quantize_weights(input_path: str, output_path: str, group_size: int = 128,
                 smooth = compute_smooth_factors(w, smooth_alpha, act_abs)  # [K]
                 w = w * smooth.unsqueeze(0)  # W_smooth[n,k] = W[n,k] * s[k]
 
-            # Step 2: MSE-optimal clipping (if not already done by AWQ)
+            # Step 2: Hadamard rotation (after smooth/AWQ, before clip/quantize)
+            # Rotates the K dimension with a block-diagonal normalized Hadamard matrix.
+            # Skip weights whose activations are quantized by fused kernels that don't
+            # yet support WHT (MLP_2: K=12288, linear2: K=15360).
+            if hadamard:
+                skip_had = ("mlp.2." in name or "linear2." in name)
+                if not skip_had:
+                    w = block_hadamard_rotate(w, K)
+
+            # Step 3: MSE-optimal clipping (if not already done by AWQ)
             if use_clip_mse and clip_ratio is None:
                 clip_ratio = find_optimal_clip_ratio(w, group_size, asymmetric)
 
-            # Step 3: Compute per-group quantization parameters
+            # Step 4: Compute per-group quantization parameters
             scale, zero_point = compute_group_params(w, group_size, asymmetric, clip_ratio)
 
-            # Step 4: Quantize (GPTQ or standard round-to-nearest)
+            # Step 5: Quantize (GPTQ or standard round-to-nearest)
             if use_gptq:
                 w_int8 = gptq_quantize(w, scale, zero_point, group_size)
             else:
@@ -518,6 +559,8 @@ def quantize_weights(input_path: str, output_path: str, group_size: int = 128,
         mode_parts.append("clip=mse")
     if use_gptq:
         mode_parts.append("GPTQ")
+    if hadamard:
+        mode_parts.append("hadamard")
     mode_str = ", ".join(mode_parts)
 
     print()
@@ -538,6 +581,8 @@ def quantize_weights(input_path: str, output_path: str, group_size: int = 128,
         metadata["quantization_clip"] = "mse"
     if use_gptq:
         metadata["quantization_gptq"] = "true"
+    if hadamard:
+        metadata["quantization_hadamard"] = "true"
     save_file(output, output_path, metadata=metadata)
     print("Done.")
 
@@ -563,6 +608,8 @@ if __name__ == "__main__":
                         help="AWQ: activation-aware weight quantization (searches optimal scaling alpha per layer)")
     parser.add_argument("--calib", type=str, default="", metavar="FILE",
                         help="Calibration file (safetensors) with per-channel activation absmax")
+    parser.add_argument("--hadamard", action="store_true",
+                        help="Apply Hadamard rotation to weight K dimensions before quantization (improves per-channel INT8)")
     args = parser.parse_args()
 
     if args.group_size < 1:
@@ -580,4 +627,4 @@ if __name__ == "__main__":
 
     quantize_weights(args.input, args.output, args.group_size, args.scale_dtype,
                      args.asymmetric, args.smooth, args.gptq, args.calib,
-                     args.awq, args.clip)
+                     args.awq, args.clip, args.hadamard)

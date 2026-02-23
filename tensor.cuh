@@ -460,11 +460,11 @@ void dequant_int8_to_bf16_vec_cuda(const int8_t* src, const void* scales, DType 
 void quantize_activations_int8_cuda(const __nv_bfloat16* X, int8_t* X_int8,
                                      float* x_scale, float* x_rowsum,
                                      int M, int K, const float* smooth,
-                                     bool need_rowsum);
+                                     bool need_rowsum, bool hadamard = false);
 void quantize_activations_int8_cuda(const float* X, int8_t* X_int8,
                                      float* x_scale, float* x_rowsum,
                                      int M, int K, const float* smooth,
-                                     bool need_rowsum);
+                                     bool need_rowsum, bool hadamard = false);
 // Post-process INT8 GEMM result: dequant correction + bias
 void int8_gemm_dequant_cuda(const int32_t* Y_i32, float* Y_out,
                              const float* x_scale,

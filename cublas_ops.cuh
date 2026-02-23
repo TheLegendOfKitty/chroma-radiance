@@ -6,10 +6,12 @@
 // Forward declarations for kernel functions (defined in kernels.cu, included after this header)
 void quantize_activations_int8_cuda(const __nv_bfloat16* X, int8_t* X_int8,
                                      float* x_scale, float* x_rowsum,
-                                     int M, int K, const float* smooth, bool need_rowsum);
+                                     int M, int K, const float* smooth,
+                                     bool need_rowsum, bool hadamard);
 void quantize_activations_int8_cuda(const float* X, int8_t* X_int8,
                                      float* x_scale, float* x_rowsum,
-                                     int M, int K, const float* smooth, bool need_rowsum);
+                                     int M, int K, const float* smooth,
+                                     bool need_rowsum, bool hadamard);
 void fp16_to_bf16_cuda(const __half* src, __nv_bfloat16* dst, int64_t n);
 void f32_to_bf16_cuda(const float* src, __nv_bfloat16* dst, int64_t n);
 void f32_to_bf16_smooth_cuda(const float* src, const float* smooth,
@@ -30,7 +32,8 @@ void int8_gemm_dequant_gelu_cuda(const int32_t* Y_i32, float* Y_out,
 void modulate_quantize_int8_cuda(const float* x, const float* shift, const float* scale,
                                   const float* smooth,
                                   int8_t* X_int8, float* x_scale, float* x_rowsum,
-                                  int M, int C, float eps, bool need_rowsum);
+                                  int M, int C, float eps, bool need_rowsum,
+                                  bool hadamard);
 void int8_dequant_gelu_quantize_cuda(
     const int32_t* Y_i32, int8_t* X_int8_out,
     float* x_scale_out, float* x_rowsum_out,
@@ -82,6 +85,9 @@ static size_t g_act_rowsum_scratch_elems = 0;
 // Persistent scratch buffer for INT32 GEMM output (used by fused dequant+gated_residual)
 static int32_t* g_gemm_i32_scratch = nullptr;
 static size_t g_gemm_i32_scratch_elems = 0;
+
+// Global flag: set at model load time if weights were Hadamard-rotated offline
+extern bool g_hadamard_enabled;
 
 // Algorithm cache: avoid repeated heuristic lookups for the same (M,N,K,types) combo
 struct LtAlgoKey {
@@ -387,15 +393,15 @@ static void linear(const Tensor& x, const Tensor& W, const Tensor* bias, Tensor&
 
             if (x.dtype == DType::F32) {
                 quantize_activations_int8_cuda(x.f32(), x_i8, x_sc, x_rs,
-                                                (int)M, (int)K, W.quant_smooth, need_rowsum);
+                                                (int)M, (int)K, W.quant_smooth, need_rowsum, g_hadamard_enabled);
             } else if (x.dtype == DType::BF16) {
                 quantize_activations_int8_cuda(x.bf16(), x_i8, x_sc, x_rs,
-                                                (int)M, (int)K, W.quant_smooth, need_rowsum);
+                                                (int)M, (int)K, W.quant_smooth, need_rowsum, g_hadamard_enabled);
             } else {
                 Tensor x_conv = Tensor::alloc_shape(x.ndim, x.shape, DType::BF16, true);
                 fp16_to_bf16_cuda(x.fp16(), x_conv.bf16(), x.numel());
                 quantize_activations_int8_cuda(x_conv.bf16(), x_i8, x_sc, x_rs,
-                                                (int)M, (int)K, W.quant_smooth, need_rowsum);
+                                                (int)M, (int)K, W.quant_smooth, need_rowsum, g_hadamard_enabled);
             }
 
             linear_int8_gemm(M, K, N, x_i8, W.i8(), (int32_t*)output.data);
@@ -577,15 +583,15 @@ static QuantizedAct quantize_act(const Tensor& x, const float* smooth, bool need
 
     if (x.dtype == DType::F32) {
         quantize_activations_int8_cuda(x.f32(), qa.x_int8, qa.x_scale, qa.x_rowsum,
-                                        (int)M, (int)K, smooth, need_rowsum);
+                                        (int)M, (int)K, smooth, need_rowsum, g_hadamard_enabled);
     } else if (x.dtype == DType::BF16) {
         quantize_activations_int8_cuda(x.bf16(), qa.x_int8, qa.x_scale, qa.x_rowsum,
-                                        (int)M, (int)K, smooth, need_rowsum);
+                                        (int)M, (int)K, smooth, need_rowsum, g_hadamard_enabled);
     } else {
         Tensor x_conv = Tensor::alloc_shape(x.ndim, x.shape, DType::BF16, true);
         fp16_to_bf16_cuda(x.fp16(), x_conv.bf16(), x.numel());
         quantize_activations_int8_cuda(x_conv.bf16(), qa.x_int8, qa.x_scale, qa.x_rowsum,
-                                        (int)M, (int)K, smooth, need_rowsum);
+                                        (int)M, (int)K, smooth, need_rowsum, g_hadamard_enabled);
     }
     return qa;
 }
@@ -673,10 +679,10 @@ static void linear_gated_residual(const Tensor& x, const Tensor& W, const Tensor
 
         if (x.dtype == DType::F32) {
             quantize_activations_int8_cuda(x.f32(), x_i8, x_sc, x_rs,
-                                            (int)M, (int)K, W.quant_smooth, need_rowsum);
+                                            (int)M, (int)K, W.quant_smooth, need_rowsum, g_hadamard_enabled);
         } else if (x.dtype == DType::BF16) {
             quantize_activations_int8_cuda(x.bf16(), x_i8, x_sc, x_rs,
-                                            (int)M, (int)K, W.quant_smooth, need_rowsum);
+                                            (int)M, (int)K, W.quant_smooth, need_rowsum, g_hadamard_enabled);
         } else {
             fprintf(stderr, "Unsupported dtype for linear_gated_residual\n");
             exit(1);
@@ -716,7 +722,7 @@ static QuantizedAct quantize_act_modulate(const float* x, const float* shift,
 
     modulate_quantize_int8_cuda(x, shift, scale, smooth,
                                  qa.x_int8, qa.x_scale, qa.x_rowsum,
-                                 (int)M, (int)K, eps, need_rowsum);
+                                 (int)M, (int)K, eps, need_rowsum, g_hadamard_enabled);
     return qa;
 }
 
