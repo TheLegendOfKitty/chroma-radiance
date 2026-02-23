@@ -3,6 +3,44 @@
 #include <cublas_v2.h>
 #include <cublasLt.h>
 
+// Forward declarations for kernel functions (defined in kernels.cu, included after this header)
+void quantize_activations_int8_cuda(const __nv_bfloat16* X, int8_t* X_int8,
+                                     float* x_scale, float* x_rowsum,
+                                     int M, int K, const float* smooth, bool need_rowsum);
+void quantize_activations_int8_cuda(const float* X, int8_t* X_int8,
+                                     float* x_scale, float* x_rowsum,
+                                     int M, int K, const float* smooth, bool need_rowsum);
+void fp16_to_bf16_cuda(const __half* src, __nv_bfloat16* dst, int64_t n);
+void f32_to_bf16_cuda(const float* src, __nv_bfloat16* dst, int64_t n);
+void f32_to_bf16_smooth_cuda(const float* src, const float* smooth,
+                              __nv_bfloat16* dst, int64_t total, int64_t K);
+void smooth_div_bf16_cuda(const __nv_bfloat16* X, const float* smooth,
+                           __nv_bfloat16* out, int M, int K);
+void dequant_int8_to_bf16_vec_cuda(const int8_t* src, const void* scales, DType scales_dtype,
+                                    const int8_t* zero_points,
+                                    __nv_bfloat16* dst, int64_t N, int64_t K, int group_size);
+void int8_gemm_dequant_cuda(const int32_t* Y_i32, float* Y_out,
+                             const float* x_scale, const void* w_scale, DType w_scale_dtype,
+                             const int8_t* zp, const float* x_rowsum,
+                             const float* bias, int M, int N);
+void int8_gemm_dequant_gelu_cuda(const int32_t* Y_i32, float* Y_out,
+                                  const float* x_scale, const void* w_scale, DType w_scale_dtype,
+                                  const int8_t* zp, const float* x_rowsum,
+                                  const float* bias, int M, int N);
+void modulate_quantize_int8_cuda(const float* x, const float* shift, const float* scale,
+                                  const float* smooth,
+                                  int8_t* X_int8, float* x_scale, float* x_rowsum,
+                                  int M, int C, float eps, bool need_rowsum);
+void int8_dequant_gelu_quantize_cuda(
+    const int32_t* Y_i32, int8_t* X_int8_out,
+    float* x_scale_out, float* x_rowsum_out,
+    const float* x_scale_prev, const void* w_scale_prev, int w_scale_dtype,
+    const int8_t* zp_prev, const float* x_rowsum_prev,
+    const float* bias, const float* smooth_next,
+    int M, int N, bool need_rowsum);
+void calibrate_act_absmax_cuda(const __nv_bfloat16* X, float* accum, int M, int K);
+void f32_to_fp16_cuda(const float* src, __half* dst, int64_t n);
+
 #define CHECK_CUBLAS(call) do { \
     cublasStatus_t err = (call); \
     if (err != CUBLAS_STATUS_SUCCESS) { \
@@ -56,6 +94,17 @@ struct LtAlgoCached {
     bool valid;
 };
 static std::unordered_map<LtAlgoKey, LtAlgoCached, LtAlgoKeyHash> g_algo_cache;
+
+// Extended cache for INT8 GEMM: also stores cublasLt descriptors to avoid
+// repeated creation/destruction (~456 calls/step × ~10µs = ~4.6ms wasted).
+struct LtInt8Cached {
+    cublasLtMatmulDesc_t matmul_desc;
+    cublasLtMatrixLayout_t layout_a, layout_b, layout_c;
+    cublasLtMatmulAlgo_t algo;
+    bool algo_valid;
+    bool initialized;
+};
+static std::unordered_map<LtAlgoKey, LtInt8Cached, LtAlgoKeyHash> g_int8_cache;
 
 struct CalibrationState {
     bool active = false;
@@ -196,35 +245,34 @@ static void linear_lt(int64_t M, int64_t K, int64_t N,
 
 // INT8 x INT8 → INT32 GEMM via cublasLt with INT8 tensor cores
 // Y_int32[M,N] = X_int8[M,K] @ W_int8[N,K]^T
-// Uses 32MB workspace + heuristic algorithm selection + caching (same as BF16 path)
+// Caches cublasLt descriptors (matmul_desc + 3 layouts + heuristic algo) per (M,K,N)
+// to avoid repeated creation/destruction (~456 calls/step × ~10µs = ~4.6ms saved).
 static void linear_int8_gemm(int64_t M, int64_t K, int64_t N,
                                const int8_t* x_int8, const int8_t* w_int8,
                                int32_t* Y_int32) {
     int32_t alpha = 1, beta = 0;
 
-    cublasLtMatmulDesc_t matmul_desc;
-    CHECK_CUBLAS(cublasLtMatmulDescCreate(&matmul_desc, CUBLAS_COMPUTE_32I, CUDA_R_32I));
+    LtAlgoKey cache_key = {M, K, N, CUDA_R_8I, CUDA_R_8I, false};
+    auto it = g_int8_cache.find(cache_key);
+    if (it == g_int8_cache.end()) {
+        LtInt8Cached c;
+        c.initialized = true;
 
-    // Row-major: C = X @ W^T
-    // Col-major perspective: C'[N,M] = W[N,K] @ X'[K,M]
-    cublasOperation_t transa = CUBLAS_OP_T;
-    cublasOperation_t transb = CUBLAS_OP_N;
-    CHECK_CUBLAS(cublasLtMatmulDescSetAttribute(matmul_desc, CUBLASLT_MATMUL_DESC_TRANSA, &transa, sizeof(transa)));
-    CHECK_CUBLAS(cublasLtMatmulDescSetAttribute(matmul_desc, CUBLASLT_MATMUL_DESC_TRANSB, &transb, sizeof(transb)));
+        CHECK_CUBLAS(cublasLtMatmulDescCreate(&c.matmul_desc, CUBLAS_COMPUTE_32I, CUDA_R_32I));
+        cublasOperation_t transa = CUBLAS_OP_T;
+        cublasOperation_t transb = CUBLAS_OP_N;
+        CHECK_CUBLAS(cublasLtMatmulDescSetAttribute(c.matmul_desc, CUBLASLT_MATMUL_DESC_TRANSA, &transa, sizeof(transa)));
+        CHECK_CUBLAS(cublasLtMatmulDescSetAttribute(c.matmul_desc, CUBLASLT_MATMUL_DESC_TRANSB, &transb, sizeof(transb)));
 
-    // Matrix layouts (column-major perspective):
-    // A = W row-major [N,K] → col-major [K,N], ld=K (transposed to [N,K])
-    // B = X row-major [M,K] → col-major [K,M], ld=K
-    // C = Y row-major [M,N] → col-major [N,M], ld=N
-    cublasLtMatrixLayout_t layout_a, layout_b, layout_c;
-    CHECK_CUBLAS(cublasLtMatrixLayoutCreate(&layout_a, CUDA_R_8I, K, N, K));
-    CHECK_CUBLAS(cublasLtMatrixLayoutCreate(&layout_b, CUDA_R_8I, K, M, K));
-    CHECK_CUBLAS(cublasLtMatrixLayoutCreate(&layout_c, CUDA_R_32I, N, M, N));
+        // Matrix layouts (column-major perspective):
+        // A = W row-major [N,K] → col-major [K,N], ld=K (transposed to [N,K])
+        // B = X row-major [M,K] → col-major [K,M], ld=K
+        // C = Y row-major [M,N] → col-major [N,M], ld=N
+        CHECK_CUBLAS(cublasLtMatrixLayoutCreate(&c.layout_a, CUDA_R_8I, K, N, K));
+        CHECK_CUBLAS(cublasLtMatrixLayoutCreate(&c.layout_b, CUDA_R_8I, K, M, K));
+        CHECK_CUBLAS(cublasLtMatrixLayoutCreate(&c.layout_c, CUDA_R_32I, N, M, N));
 
-    // Cached heuristic algorithm selection
-    LtAlgoKey algo_key = {M, K, N, CUDA_R_8I, CUDA_R_8I, false};
-    auto cache_it = g_algo_cache.find(algo_key);
-    if (cache_it == g_algo_cache.end()) {
+        // Heuristic algorithm selection
         cublasLtMatmulPreference_t pref;
         CHECK_CUBLAS(cublasLtMatmulPreferenceCreate(&pref));
         CHECK_CUBLAS(cublasLtMatmulPreferenceSetAttribute(pref,
@@ -234,33 +282,28 @@ static void linear_int8_gemm(int64_t M, int64_t K, int64_t N,
         cublasLtMatmulHeuristicResult_t heuristic;
         int n_results = 0;
         cublasStatus_t heur_status = cublasLtMatmulAlgoGetHeuristic(g_cublaslt,
-            matmul_desc, layout_a, layout_b, layout_c, layout_c,
+            c.matmul_desc, c.layout_a, c.layout_b, c.layout_c, c.layout_c,
             pref, 1, &heuristic, &n_results);
 
-        LtAlgoCached cached;
-        cached.valid = (heur_status == CUBLAS_STATUS_SUCCESS && n_results > 0);
-        if (cached.valid) cached.algo = heuristic.algo;
-        cache_it = g_algo_cache.emplace(algo_key, cached).first;
+        c.algo_valid = (heur_status == CUBLAS_STATUS_SUCCESS && n_results > 0);
+        if (c.algo_valid) c.algo = heuristic.algo;
 
         cublasLtMatmulPreferenceDestroy(pref);
+        it = g_int8_cache.emplace(cache_key, c).first;
     }
 
+    const auto& c = it->second;
     CHECK_CUBLAS(cublasLtMatmul(g_cublaslt,
-        matmul_desc,
+        c.matmul_desc,
         &alpha,
-        w_int8, layout_a,     // A = W
-        x_int8, layout_b,     // B = X
+        w_int8, c.layout_a,     // A = W
+        x_int8, c.layout_b,     // B = X
         &beta,
-        Y_int32, layout_c,    // C = output
-        Y_int32, layout_c,    // D = output (in-place)
-        cache_it->second.valid ? &cache_it->second.algo : nullptr,
+        Y_int32, c.layout_c,    // C = output
+        Y_int32, c.layout_c,    // D = output (in-place)
+        c.algo_valid ? &c.algo : nullptr,
         g_cublas_workspace, g_cublas_workspace_size,
-        0));                   // stream
-
-    cublasLtMatrixLayoutDestroy(layout_a);
-    cublasLtMatrixLayoutDestroy(layout_b);
-    cublasLtMatrixLayoutDestroy(layout_c);
-    cublasLtMatmulDescDestroy(matmul_desc);
+        0));                     // stream
 }
 
 // Linear: output = x @ W^T + bias
@@ -542,4 +585,74 @@ static void linear_prequant(const QuantizedAct& qa, const Tensor& W,
                             (const int8_t*)W.quant_zero_points,
                             need_rowsum ? qa.x_rowsum : nullptr,
                             (const float*)bias_data, (int)M, (int)N);
+}
+
+// INT8 TC GEMM + fused dequant+GELU with pre-quantized activations.
+// Same as linear_prequant but applies GELU in the dequant kernel.
+static void linear_prequant_gelu(const QuantizedAct& qa, const Tensor& W,
+                                  const Tensor* bias, Tensor& output) {
+    int64_t M = qa.M, K = qa.K;
+    int64_t N = W.shape[0];
+    assert(W.dtype == DType::INT8);
+    assert(W.shape[1] == K);
+
+    const void* bias_data = (bias && bias->on_gpu && bias->dtype == DType::F32) ? bias->data : nullptr;
+
+    linear_int8_gemm(M, K, N, qa.x_int8, W.i8(), (int32_t*)output.data);
+
+    bool need_rowsum = (W.quant_zero_points != nullptr);
+    int8_gemm_dequant_gelu_cuda((const int32_t*)output.data, output.f32(),
+                                 qa.x_scale, W.quant_scales, W.quant_scales_dtype,
+                                 (const int8_t*)W.quant_zero_points,
+                                 need_rowsum ? qa.x_rowsum : nullptr,
+                                 (const float*)bias_data, (int)M, (int)N);
+}
+
+// Fused modulate + INT8 activation quantization into persistent scratch buffers.
+// Replaces: modulate_cuda() → F32 buffer → quantize_activations_int8_cuda()
+// Returns QuantizedAct with pointers valid until next quantize_act/quantize_act_modulate call.
+static QuantizedAct quantize_act_modulate(const float* x, const float* shift,
+                                           const float* scale, float eps,
+                                           int64_t M, int64_t K,
+                                           const float* smooth, bool need_rowsum) {
+    QuantizedAct qa;
+    qa.M = M;
+    qa.K = K;
+    qa.x_int8 = ensure_act_int8_scratch(M * K);
+    qa.x_scale = ensure_act_scale_scratch(M);
+    qa.x_rowsum = need_rowsum ? ensure_act_rowsum_scratch(M) : nullptr;
+
+    modulate_quantize_int8_cuda(x, shift, scale, smooth,
+                                 qa.x_int8, qa.x_scale, qa.x_rowsum,
+                                 (int)M, (int)K, eps, need_rowsum);
+    return qa;
+}
+
+// Fused dequant + GELU + INT8 quantize (3-way fusion) into persistent scratch buffers.
+// For double_block MLP: eliminates ALL intermediates between MLP_0 and MLP_2.
+// Returns QuantizedAct for the next INT8 GEMM.
+static QuantizedAct dequant_gelu_quantize(
+    const int32_t* Y_i32, const QuantizedAct& qa_prev,
+    const Tensor& W_prev, const Tensor* bias,
+    const float* smooth_next, bool need_rowsum_next,
+    int64_t M, int64_t N) {
+
+    QuantizedAct qa;
+    qa.M = M;
+    qa.K = N;  // output dim of MLP_0 = input dim of MLP_2
+    qa.x_int8 = ensure_act_int8_scratch(M * N);
+    qa.x_scale = ensure_act_scale_scratch(M);
+    qa.x_rowsum = need_rowsum_next ? ensure_act_rowsum_scratch(M) : nullptr;
+
+    const void* bias_data = (bias && bias->on_gpu && bias->dtype == DType::F32) ? bias->data : nullptr;
+    bool has_zp_prev = (W_prev.quant_zero_points != nullptr);
+
+    int8_dequant_gelu_quantize_cuda(
+        Y_i32, qa.x_int8, qa.x_scale, qa.x_rowsum,
+        qa_prev.x_scale, W_prev.quant_scales, (int)W_prev.quant_scales_dtype,
+        has_zp_prev ? (const int8_t*)W_prev.quant_zero_points : nullptr,
+        has_zp_prev ? qa_prev.x_rowsum : nullptr,
+        (const float*)bias_data, smooth_next,
+        (int)M, (int)N, need_rowsum_next);
+    return qa;
 }

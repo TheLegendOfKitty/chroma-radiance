@@ -51,6 +51,22 @@ void scale_cuda(float* x, float scale, int64_t n);
 void slice_columns_cuda(const float* src, float* dst,
                          int64_t L, int64_t total_cols,
                          int64_t col_offset, int64_t slice_cols);
+void modulate_quantize_int8_cuda(const float* x, const float* shift, const float* scale,
+                                  const float* smooth,
+                                  int8_t* X_int8, float* x_scale, float* x_rowsum,
+                                  int M, int C, float eps, bool need_rowsum);
+void int8_dequant_gelu_quantize_cuda(
+    const int32_t* Y_i32, int8_t* X_int8_out,
+    float* x_scale_out, float* x_rowsum_out,
+    const float* x_scale_prev, const void* w_scale_prev, int w_scale_dtype,
+    const int8_t* zp_prev, const float* x_rowsum_prev,
+    const float* bias, const float* smooth_next,
+    int M, int N, bool need_rowsum);
+void int8_gemm_dequant_gelu_cuda(const int32_t* Y_i32, float* Y_out,
+                                  const float* x_scale,
+                                  const void* w_scale, DType w_scale_dtype,
+                                  const int8_t* zp, const float* x_rowsum,
+                                  const float* bias, int M, int N);
 
 // ============================================================================
 // Helper: Linear layer (x @ W^T + bias)
@@ -562,12 +578,10 @@ struct ChromaRadiance {
 
         if (iq_w.dtype == DType::INT8 && iq_w.quant_group_size >= (int)iq_w.shape[1]
             && iq_w.shape[1] % 4 == 0) {
-            // Per-channel INT8: modulate → F32, quantize activations
-            Tensor img_mod = Tensor::alloc({img_tokens, (int64_t)hidden_size}, DType::F32, true);
-            modulate_cuda(img.f32(), img_shift1, img_scale1, img_mod.f32(),
-                          img_tokens, hidden_size, 1e-6f);
-            QuantizedAct qa = quantize_act(img_mod, iq_w.quant_smooth,
-                                            iq_w.quant_zero_points != nullptr);
+            // Per-channel INT8: fused modulate → quantize (no F32 intermediate)
+            QuantizedAct qa = quantize_act_modulate(img.f32(), img_shift1, img_scale1,
+                1e-6f, img_tokens, hidden_size, iq_w.quant_smooth,
+                iq_w.quant_zero_points != nullptr);
             linear_prequant(qa, iq_w, &iq_b, img_q_view);
             linear_prequant(qa, ik_w, &ik_b, img_k_view);
             linear_prequant(qa, iv_w, &iv_b, img_v_view);
@@ -595,11 +609,10 @@ struct ChromaRadiance {
 
         if (tq_w.dtype == DType::INT8 && tq_w.quant_group_size >= (int)tq_w.shape[1]
             && tq_w.shape[1] % 4 == 0) {
-            Tensor txt_mod_t = Tensor::alloc({txt_tokens, (int64_t)hidden_size}, DType::F32, true);
-            modulate_cuda(txt.f32(), txt_shift1, txt_scale1, txt_mod_t.f32(),
-                          txt_tokens, hidden_size, 1e-6f);
-            QuantizedAct qa = quantize_act(txt_mod_t, tq_w.quant_smooth,
-                                            tq_w.quant_zero_points != nullptr);
+            // Per-channel INT8: fused modulate → quantize (no F32 intermediate)
+            QuantizedAct qa = quantize_act_modulate(txt.f32(), txt_shift1, txt_scale1,
+                1e-6f, txt_tokens, hidden_size, tq_w.quant_smooth,
+                tq_w.quant_zero_points != nullptr);
             linear_prequant(qa, tq_w, &tq_b, txt_q_view);
             linear_prequant(qa, tk_w, &tk_b, txt_k_view);
             linear_prequant(qa, tv_w, &tv_b, txt_v_view);
@@ -631,34 +644,84 @@ struct ChromaRadiance {
         gated_residual_cuda(img.f32(), img_attn_proj.f32(), img_gate1,
                             img.f32(), img_tokens, hidden_size);
 
-        // Image MLP sublayer: fused modulate→BF16 + fused GELU→BF16
-        Tensor img_mod2 = Tensor::alloc({img_tokens, (int64_t)hidden_size}, DType::BF16, true);
-        modulate_to_bf16_cuda(img.f32(), img_shift2, img_scale2, img_mod2.bf16(),
-                              img_tokens, hidden_size, 1e-6f);
+        // Image MLP sublayer
+        int64_t K_mlp = w.img_mlp_0_w.shape[1];
+        if (w.img_mlp_0_w.dtype == DType::INT8
+            && w.img_mlp_0_w.quant_group_size >= (int)K_mlp
+            && K_mlp % 4 == 0) {
+            // Per-channel INT8: fused modulate→quantize, 3-way dequant+GELU+quantize
+            QuantizedAct qa_mlp = quantize_act_modulate(img.f32(), img_shift2, img_scale2,
+                1e-6f, img_tokens, hidden_size, w.img_mlp_0_w.quant_smooth,
+                w.img_mlp_0_w.quant_zero_points != nullptr);
 
-        Tensor img_mlp_h = linear_forward(img_mod2, w.img_mlp_0_w, &w.img_mlp_0_b);
-        Tensor img_mlp_h_bf16 = Tensor::alloc({img_tokens, (int64_t)mlp_hidden}, DType::BF16, true);
-        gelu_to_bf16_cuda(img_mlp_h.f32(), img_mlp_h_bf16.bf16(), img_tokens * mlp_hidden);
-        Tensor img_mlp_out = linear_forward(img_mlp_h_bf16, w.img_mlp_2_w, &w.img_mlp_2_b);
-        gated_residual_cuda(img.f32(), img_mlp_out.f32(), img_gate2,
-                            img.f32(), img_tokens, hidden_size);
+            Tensor img_mlp_h = Tensor::alloc({img_tokens, (int64_t)mlp_hidden}, DType::F32, true);
+            linear_int8_gemm(img_tokens, hidden_size, mlp_hidden,
+                             qa_mlp.x_int8, w.img_mlp_0_w.i8(), (int32_t*)img_mlp_h.data);
+
+            QuantizedAct qa_mlp2 = dequant_gelu_quantize(
+                (const int32_t*)img_mlp_h.data, qa_mlp, w.img_mlp_0_w, &w.img_mlp_0_b,
+                w.img_mlp_2_w.quant_smooth, w.img_mlp_2_w.quant_zero_points != nullptr,
+                img_tokens, mlp_hidden);
+
+            Tensor img_mlp_out = Tensor::alloc({img_tokens, (int64_t)hidden_size}, DType::F32, true);
+            linear_prequant(qa_mlp2, w.img_mlp_2_w, &w.img_mlp_2_b, img_mlp_out);
+            gated_residual_cuda(img.f32(), img_mlp_out.f32(), img_gate2,
+                                img.f32(), img_tokens, hidden_size);
+        } else {
+            // Per-group INT8 or BF16: fused modulate→BF16 + fused GELU→BF16
+            Tensor img_mod2 = Tensor::alloc({img_tokens, (int64_t)hidden_size}, DType::BF16, true);
+            modulate_to_bf16_cuda(img.f32(), img_shift2, img_scale2, img_mod2.bf16(),
+                                  img_tokens, hidden_size, 1e-6f);
+
+            Tensor img_mlp_h = linear_forward(img_mod2, w.img_mlp_0_w, &w.img_mlp_0_b);
+            Tensor img_mlp_h_bf16 = Tensor::alloc({img_tokens, (int64_t)mlp_hidden}, DType::BF16, true);
+            gelu_to_bf16_cuda(img_mlp_h.f32(), img_mlp_h_bf16.bf16(), img_tokens * mlp_hidden);
+            Tensor img_mlp_out = linear_forward(img_mlp_h_bf16, w.img_mlp_2_w, &w.img_mlp_2_b);
+            gated_residual_cuda(img.f32(), img_mlp_out.f32(), img_gate2,
+                                img.f32(), img_tokens, hidden_size);
+        }
 
         // === Text: proj + gated residual ===
         Tensor txt_attn_proj = linear_forward(txt_attn, w.txt_proj_w, &w.txt_proj_b);
         gated_residual_cuda(txt.f32(), txt_attn_proj.f32(), txt_gate1,
                             txt.f32(), txt_tokens, hidden_size);
 
-        // Text MLP sublayer: fused modulate→BF16 + fused GELU→BF16
-        Tensor txt_mod2 = Tensor::alloc({txt_tokens, (int64_t)hidden_size}, DType::BF16, true);
-        modulate_to_bf16_cuda(txt.f32(), txt_shift2, txt_scale2, txt_mod2.bf16(),
-                              txt_tokens, hidden_size, 1e-6f);
+        // Text MLP sublayer
+        int64_t K_mlp_txt = w.txt_mlp_0_w.shape[1];
+        if (w.txt_mlp_0_w.dtype == DType::INT8
+            && w.txt_mlp_0_w.quant_group_size >= (int)K_mlp_txt
+            && K_mlp_txt % 4 == 0) {
+            // Per-channel INT8: fused modulate→quantize, 3-way dequant+GELU+quantize
+            QuantizedAct qa_mlp = quantize_act_modulate(txt.f32(), txt_shift2, txt_scale2,
+                1e-6f, txt_tokens, hidden_size, w.txt_mlp_0_w.quant_smooth,
+                w.txt_mlp_0_w.quant_zero_points != nullptr);
 
-        Tensor txt_mlp_h = linear_forward(txt_mod2, w.txt_mlp_0_w, &w.txt_mlp_0_b);
-        Tensor txt_mlp_h_bf16 = Tensor::alloc({txt_tokens, (int64_t)mlp_hidden}, DType::BF16, true);
-        gelu_to_bf16_cuda(txt_mlp_h.f32(), txt_mlp_h_bf16.bf16(), txt_tokens * mlp_hidden);
-        Tensor txt_mlp_out = linear_forward(txt_mlp_h_bf16, w.txt_mlp_2_w, &w.txt_mlp_2_b);
-        gated_residual_cuda(txt.f32(), txt_mlp_out.f32(), txt_gate2,
-                            txt.f32(), txt_tokens, hidden_size);
+            Tensor txt_mlp_h = Tensor::alloc({txt_tokens, (int64_t)mlp_hidden}, DType::F32, true);
+            linear_int8_gemm(txt_tokens, hidden_size, mlp_hidden,
+                             qa_mlp.x_int8, w.txt_mlp_0_w.i8(), (int32_t*)txt_mlp_h.data);
+
+            QuantizedAct qa_mlp2 = dequant_gelu_quantize(
+                (const int32_t*)txt_mlp_h.data, qa_mlp, w.txt_mlp_0_w, &w.txt_mlp_0_b,
+                w.txt_mlp_2_w.quant_smooth, w.txt_mlp_2_w.quant_zero_points != nullptr,
+                txt_tokens, mlp_hidden);
+
+            Tensor txt_mlp_out = Tensor::alloc({txt_tokens, (int64_t)hidden_size}, DType::F32, true);
+            linear_prequant(qa_mlp2, w.txt_mlp_2_w, &w.txt_mlp_2_b, txt_mlp_out);
+            gated_residual_cuda(txt.f32(), txt_mlp_out.f32(), txt_gate2,
+                                txt.f32(), txt_tokens, hidden_size);
+        } else {
+            // Per-group INT8 or BF16: fused modulate→BF16 + fused GELU→BF16
+            Tensor txt_mod2 = Tensor::alloc({txt_tokens, (int64_t)hidden_size}, DType::BF16, true);
+            modulate_to_bf16_cuda(txt.f32(), txt_shift2, txt_scale2, txt_mod2.bf16(),
+                                  txt_tokens, hidden_size, 1e-6f);
+
+            Tensor txt_mlp_h = linear_forward(txt_mod2, w.txt_mlp_0_w, &w.txt_mlp_0_b);
+            Tensor txt_mlp_h_bf16 = Tensor::alloc({txt_tokens, (int64_t)mlp_hidden}, DType::BF16, true);
+            gelu_to_bf16_cuda(txt_mlp_h.f32(), txt_mlp_h_bf16.bf16(), txt_tokens * mlp_hidden);
+            Tensor txt_mlp_out = linear_forward(txt_mlp_h_bf16, w.txt_mlp_2_w, &w.txt_mlp_2_b);
+            gated_residual_cuda(txt.f32(), txt_mlp_out.f32(), txt_gate2,
+                                txt.f32(), txt_tokens, hidden_size);
+        }
     }
 
     // ======================================================================
@@ -721,15 +784,15 @@ struct ChromaRadiance {
 
         if (sq_w.dtype == DType::INT8 && sq_w.quant_group_size >= (int)sq_w.shape[1]
             && sq_w.shape[1] % 4 == 0) {
-            // Per-channel INT8: modulate → F32, quantize activations
-            Tensor x_mod = Tensor::alloc({L, (int64_t)hidden_size}, DType::F32, true);
-            modulate_cuda(x.f32(), shift, scale, x_mod.f32(), L, hidden_size, 1e-6f);
-            QuantizedAct qa = quantize_act(x_mod, sq_w.quant_smooth,
-                                            sq_w.quant_zero_points != nullptr);
+            // Per-channel INT8: fused modulate → quantize (no F32 intermediate)
+            QuantizedAct qa = quantize_act_modulate(x.f32(), shift, scale,
+                1e-6f, L, hidden_size, sq_w.quant_smooth,
+                sq_w.quant_zero_points != nullptr);
             linear_prequant(qa, sq_w, &sq_b, q_t);
             linear_prequant(qa, sk_w, &sk_b, k_t);
             linear_prequant(qa, sv_w, &sv_b, v_t);
-            linear_prequant(qa, sm_w, &sm_b, mlp_t);
+            // Fused dequant+GELU for MLP (eliminates separate GELU pass)
+            linear_prequant_gelu(qa, sm_w, &sm_b, mlp_t);
         } else {
             // Per-group INT8 or BF16: fused modulate → BF16 (eliminates f32_to_bf16)
             Tensor x_mod_bf16 = Tensor::alloc({L, (int64_t)hidden_size}, DType::BF16, true);
@@ -738,6 +801,8 @@ struct ChromaRadiance {
             linear(x_mod_bf16, sk_w, &sk_b, k_t);
             linear(x_mod_bf16, sv_w, &sv_b, v_t);
             linear(x_mod_bf16, sm_w, &sm_b, mlp_t);
+            // GELU on MLP portion (not needed above — fused into dequant)
+            gelu_cuda(mlp_t.f32(), mlp_t.f32(), L * mlp_hidden);
         }
 
         // QKNorm
@@ -750,9 +815,6 @@ struct ChromaRadiance {
         Tensor v_r = v_t.reshape({L, (int64_t)num_heads, (int64_t)d_head});
 
         Tensor attn_out = attention_with_rope(q_r, k_r, v_r, pe, num_heads, d_head, attn_mask);
-
-        // GELU on MLP portion
-        gelu_cuda(mlp_t.f32(), mlp_t.f32(), L * mlp_hidden);
 
         // Fused concat → BF16: concatenate attn(3072) + GELU'd mlp(12288), output BF16
         // Eliminates separate concat + f32_to_bf16 conversion before linear2

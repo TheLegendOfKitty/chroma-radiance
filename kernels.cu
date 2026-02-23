@@ -1681,13 +1681,275 @@ void quantize_activations_int8_cuda(const float* X, int8_t* X_int8,
 }
 
 // ============================================================================
+// Fused modulate (LayerNorm + affine) + INT8 activation quantization
+// Replaces modulate_cuda() → F32 buffer → quantize_activations_int8_cuda()
+// x: [M, C], shift/scale: [C], smooth: [C] or nullptr
+// Output: X_int8[M,C], x_scale[M], x_rowsum[M] (if NEED_ROWSUM)
+// Uses shared memory to cache modulated values, avoiding an F32 intermediate.
+// ============================================================================
+
+template<bool NEED_ROWSUM>
+__global__ void modulate_quantize_int8_kernel(
+    const float* __restrict__ x,           // [M, C]
+    const float* __restrict__ shift,       // [C]
+    const float* __restrict__ scale,       // [C]
+    const float* __restrict__ smooth,      // [C] or nullptr
+    int8_t* __restrict__ X_int8,           // [M, C]
+    float* __restrict__ x_scale_out,       // [M]
+    float* __restrict__ x_rowsum_out,      // [M] (only written when NEED_ROWSUM)
+    int M, int C, float eps)
+{
+    int row = blockIdx.x;
+    if (row >= M) return;
+    const float* xr = x + (int64_t)row * C;
+    int8_t* out_row = X_int8 + (int64_t)row * C;
+
+    // Dynamic shared memory layout: [C floats for cached values] [256 floats for reduction]
+    extern __shared__ char mod_q_smem[];
+    float* cached = reinterpret_cast<float*>(mod_q_smem);
+    float* sdata = cached + C;
+
+    // Pass 1: compute mean for LayerNorm
+    float sum = 0.0f;
+    for (int i = threadIdx.x; i < C; i += blockDim.x)
+        sum += xr[i];
+    sdata[threadIdx.x] = sum;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) sdata[threadIdx.x] += sdata[threadIdx.x + s];
+        __syncthreads();
+    }
+    float mean = sdata[0] / C;
+    __syncthreads();
+
+    // Pass 2: compute variance for LayerNorm
+    float var_sum = 0.0f;
+    for (int i = threadIdx.x; i < C; i += blockDim.x) {
+        float d = xr[i] - mean;
+        var_sum += d * d;
+    }
+    sdata[threadIdx.x] = var_sum;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) sdata[threadIdx.x] += sdata[threadIdx.x + s];
+        __syncthreads();
+    }
+    float inv_std = rsqrtf(sdata[0] / C + eps);
+    __syncthreads();
+
+    // Pass 3: apply modulate + smooth, cache in smem, find absmax
+    float local_max = 0.0f;
+    for (int i = threadIdx.x; i < C; i += blockDim.x) {
+        float normed = (xr[i] - mean) * inv_std;
+        float val = normed * (1.0f + scale[i]) + shift[i];
+        if (smooth) val /= smooth[i];
+        cached[i] = val;
+        local_max = fmaxf(local_max, fabsf(val));
+    }
+    sdata[threadIdx.x] = local_max;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s)
+            sdata[threadIdx.x] = fmaxf(sdata[threadIdx.x], sdata[threadIdx.x + s]);
+        __syncthreads();
+    }
+    float absmax = sdata[0];
+    float inv_scale = (absmax > 1e-10f) ? 127.0f / absmax : 0.0f;
+    if (threadIdx.x == 0) x_scale_out[row] = absmax / 127.0f;
+    __syncthreads();
+
+    // Pass 4: quantize from shared memory cache
+    int local_sum = 0;
+    const int k4_limit = C & ~3;
+    for (int k = threadIdx.x * 4; k < k4_limit; k += blockDim.x * 4) {
+        int q0 = max(-128, min(127, __float2int_rn(cached[k]     * inv_scale)));
+        int q1 = max(-128, min(127, __float2int_rn(cached[k + 1] * inv_scale)));
+        int q2 = max(-128, min(127, __float2int_rn(cached[k + 2] * inv_scale)));
+        int q3 = max(-128, min(127, __float2int_rn(cached[k + 3] * inv_scale)));
+        *reinterpret_cast<int32_t*>(out_row + k) =
+            (q0 & 0xFF) | ((q1 & 0xFF) << 8) | ((q2 & 0xFF) << 16) | ((q3 & 0xFF) << 24);
+        if constexpr (NEED_ROWSUM) local_sum += q0 + q1 + q2 + q3;
+    }
+    for (int k = k4_limit + threadIdx.x; k < C; k += blockDim.x) {
+        int q = max(-128, min(127, __float2int_rn(cached[k] * inv_scale)));
+        out_row[k] = (int8_t)q;
+        if constexpr (NEED_ROWSUM) local_sum += q;
+    }
+
+    if constexpr (NEED_ROWSUM) {
+        int* idata = reinterpret_cast<int*>(sdata);
+        idata[threadIdx.x] = local_sum;
+        __syncthreads();
+        for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+            if (threadIdx.x < (unsigned)s)
+                idata[threadIdx.x] += idata[threadIdx.x + s];
+            __syncthreads();
+        }
+        if (threadIdx.x == 0) x_rowsum_out[row] = (float)idata[0];
+    }
+}
+
+void modulate_quantize_int8_cuda(const float* x, const float* shift, const float* scale,
+                                  const float* smooth,
+                                  int8_t* X_int8, float* x_scale, float* x_rowsum,
+                                  int M, int C, float eps, bool need_rowsum) {
+    int threads = 256;
+    // smem: C floats (cached modulated values) + 256 floats (reduction)
+    size_t smem_bytes = (C + threads) * sizeof(float);
+    if (need_rowsum) {
+        modulate_quantize_int8_kernel<true><<<M, threads, smem_bytes>>>(
+            x, shift, scale, smooth, X_int8, x_scale, x_rowsum, M, C, eps);
+    } else {
+        modulate_quantize_int8_kernel<false><<<M, threads, smem_bytes>>>(
+            x, shift, scale, smooth, X_int8, x_scale, x_rowsum, M, C, eps);
+    }
+}
+
+// ============================================================================
+// Fused INT8 dequant + GELU + INT8 quantize (3-way fusion)
+// For double_block MLP: eliminates ALL intermediates between MLP_0 and MLP_2.
+// Y_i32[M,N] from MLP_0 INT32 GEMM → dequant → GELU → smooth → quantize → INT8
+// Uses recompute approach: pass 1 finds absmax, pass 2 quantizes (re-does dequant+GELU).
+// ============================================================================
+
+template<bool NEED_ROWSUM, bool HAS_ZP>
+__global__ void int8_dequant_gelu_quantize_kernel(
+    const int32_t* __restrict__ Y_i32,        // [M, N] GEMM output from MLP_0
+    int8_t* __restrict__ X_int8_out,           // [M, N] quantized output for MLP_2
+    float* __restrict__ x_scale_out,           // [M] scale for MLP_2 GEMM
+    float* __restrict__ x_rowsum_out,          // [M] rowsum (only if NEED_ROWSUM)
+    const float* __restrict__ x_scale_prev,    // [M] from MLP_0 activation quantize
+    const void* __restrict__ w_scale_prev,     // [N] weight scale from MLP_0 weight
+    int w_scale_dtype,
+    const int8_t* __restrict__ zp_prev,        // [N] or nullptr
+    const float* __restrict__ x_rowsum_prev,   // [M] or nullptr
+    const float* __restrict__ bias,            // [N] or nullptr
+    const float* __restrict__ smooth_next,     // [N] or nullptr
+    int M, int N)
+{
+    int row = blockIdx.x;
+    if (row >= M) return;
+    const int32_t* y_row = Y_i32 + (int64_t)row * N;
+    int8_t* out_row = X_int8_out + (int64_t)row * N;
+
+    extern __shared__ float dgq_sdata[];
+
+    float xs_prev = x_scale_prev[row];
+    float rowsum_prev = HAS_ZP ? x_rowsum_prev[row] : 0.0f;
+
+    // Helper lambda: dequant + GELU for one element
+    // Inlined by the compiler due to __forceinline__ on gelu_val
+    auto dequant_gelu = [&](int n) -> float {
+        float raw = (float)y_row[n];
+        float ws = load_quant_scale_device(w_scale_prev, w_scale_dtype, (int64_t)n);
+        float correction = HAS_ZP ? (float)zp_prev[n] * rowsum_prev : 0.0f;
+        float val = xs_prev * ws * (raw - correction);
+        if (bias) val += bias[n];
+        return gelu_val(val);
+    };
+
+    // Pass 1: dequant → GELU → smooth → find absmax
+    float local_max = 0.0f;
+    for (int n = threadIdx.x; n < N; n += blockDim.x) {
+        float val = dequant_gelu(n);
+        if (smooth_next) val /= smooth_next[n];
+        local_max = fmaxf(local_max, fabsf(val));
+    }
+    dgq_sdata[threadIdx.x] = local_max;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s)
+            dgq_sdata[threadIdx.x] = fmaxf(dgq_sdata[threadIdx.x], dgq_sdata[threadIdx.x + s]);
+        __syncthreads();
+    }
+    float absmax = dgq_sdata[0];
+    float inv_scale = (absmax > 1e-10f) ? 127.0f / absmax : 0.0f;
+    if (threadIdx.x == 0) x_scale_out[row] = absmax / 127.0f;
+    __syncthreads();
+
+    // Pass 2: recompute dequant → GELU → smooth → quantize
+    int local_sum = 0;
+    const int n4_limit = N & ~3;
+    for (int n = threadIdx.x * 4; n < n4_limit; n += blockDim.x * 4) {
+        float v0 = dequant_gelu(n);
+        float v1 = dequant_gelu(n + 1);
+        float v2 = dequant_gelu(n + 2);
+        float v3 = dequant_gelu(n + 3);
+        if (smooth_next) {
+            v0 /= smooth_next[n]; v1 /= smooth_next[n + 1];
+            v2 /= smooth_next[n + 2]; v3 /= smooth_next[n + 3];
+        }
+        int q0 = max(-128, min(127, __float2int_rn(v0 * inv_scale)));
+        int q1 = max(-128, min(127, __float2int_rn(v1 * inv_scale)));
+        int q2 = max(-128, min(127, __float2int_rn(v2 * inv_scale)));
+        int q3 = max(-128, min(127, __float2int_rn(v3 * inv_scale)));
+        *reinterpret_cast<int32_t*>(out_row + n) =
+            (q0 & 0xFF) | ((q1 & 0xFF) << 8) | ((q2 & 0xFF) << 16) | ((q3 & 0xFF) << 24);
+        if constexpr (NEED_ROWSUM) local_sum += q0 + q1 + q2 + q3;
+    }
+    for (int n = n4_limit + threadIdx.x; n < N; n += blockDim.x) {
+        float val = dequant_gelu(n);
+        if (smooth_next) val /= smooth_next[n];
+        int q = max(-128, min(127, __float2int_rn(val * inv_scale)));
+        out_row[n] = (int8_t)q;
+        if constexpr (NEED_ROWSUM) local_sum += q;
+    }
+
+    if constexpr (NEED_ROWSUM) {
+        int* idata = reinterpret_cast<int*>(dgq_sdata);
+        idata[threadIdx.x] = local_sum;
+        __syncthreads();
+        for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+            if (threadIdx.x < (unsigned)s)
+                idata[threadIdx.x] += idata[threadIdx.x + s];
+            __syncthreads();
+        }
+        if (threadIdx.x == 0) x_rowsum_out[row] = (float)idata[0];
+    }
+}
+
+void int8_dequant_gelu_quantize_cuda(
+    const int32_t* Y_i32, int8_t* X_int8_out,
+    float* x_scale_out, float* x_rowsum_out,
+    const float* x_scale_prev, const void* w_scale_prev, int w_scale_dtype,
+    const int8_t* zp_prev, const float* x_rowsum_prev,
+    const float* bias, const float* smooth_next,
+    int M, int N, bool need_rowsum) {
+    int threads = 256;
+    size_t smem_bytes = threads * sizeof(float);
+    bool has_zp = (zp_prev != nullptr);
+    if (has_zp && need_rowsum) {
+        int8_dequant_gelu_quantize_kernel<true, true><<<M, threads, smem_bytes>>>(
+            Y_i32, X_int8_out, x_scale_out, x_rowsum_out,
+            x_scale_prev, w_scale_prev, w_scale_dtype, zp_prev, x_rowsum_prev,
+            bias, smooth_next, M, N);
+    } else if (has_zp && !need_rowsum) {
+        int8_dequant_gelu_quantize_kernel<false, true><<<M, threads, smem_bytes>>>(
+            Y_i32, X_int8_out, x_scale_out, x_rowsum_out,
+            x_scale_prev, w_scale_prev, w_scale_dtype, zp_prev, x_rowsum_prev,
+            bias, smooth_next, M, N);
+    } else if (!has_zp && need_rowsum) {
+        int8_dequant_gelu_quantize_kernel<true, false><<<M, threads, smem_bytes>>>(
+            Y_i32, X_int8_out, x_scale_out, x_rowsum_out,
+            x_scale_prev, w_scale_prev, w_scale_dtype, zp_prev, x_rowsum_prev,
+            bias, smooth_next, M, N);
+    } else {
+        int8_dequant_gelu_quantize_kernel<false, false><<<M, threads, smem_bytes>>>(
+            Y_i32, X_int8_out, x_scale_out, x_rowsum_out,
+            x_scale_prev, w_scale_prev, w_scale_dtype, zp_prev, x_rowsum_prev,
+            bias, smooth_next, M, N);
+    }
+}
+
+// ============================================================================
 // Post-process INT8 GEMM: apply dequant correction + bias
 // Y[m,n] = x_scale[m] * w_scale[n] * (Y[m,n] - zp[n] * x_rowsum[m]) + bias[n]
 // ============================================================================
 
 // Vectorized: processes 4 elements per thread via int4 load / float4 store (16B coalesced)
 // Template on HAS_ZP to avoid branching on zp/x_rowsum in the hot loop
-template<bool HAS_ZP>
+// Template on APPLY_GELU to optionally fuse GELU activation (saves separate GELU pass)
+template<bool HAS_ZP, bool APPLY_GELU>
 __global__ void int8_gemm_dequant_kernel(
     const int32_t* __restrict__ Y_i32,        // [M, N] INT32 from GEMM
     float* __restrict__ Y_out,                // [M, N] F32 output
@@ -1740,6 +2002,13 @@ __global__ void int8_gemm_dequant_kernel(
             out.w += bias[n + 3];
         }
 
+        if constexpr (APPLY_GELU) {
+            out.x = gelu_val(out.x);
+            out.y = gelu_val(out.y);
+            out.z = gelu_val(out.z);
+            out.w = gelu_val(out.w);
+        }
+
         *reinterpret_cast<float4*>(Y_out + base) = out;
     } else {
         // Scalar fallback: row boundary or tail elements
@@ -1754,8 +2023,34 @@ __global__ void int8_gemm_dequant_kernel(
             float correction = HAS_ZP ? (float)zp[ni] * x_rowsum[mi] : 0.0f;
             float val = xs * ws * (raw - correction);
             if (bias) val += bias[ni];
+            if constexpr (APPLY_GELU) val = gelu_val(val);
             Y_out[idx] = val;
         }
+    }
+}
+
+static void int8_gemm_dequant_dispatch(const int32_t* Y_i32, float* Y_out,
+                                        const float* x_scale,
+                                        const void* w_scale, DType w_scale_dtype,
+                                        const int8_t* zp, const float* x_rowsum,
+                                        const float* bias, int M, int N,
+                                        bool apply_gelu) {
+    int threads = 256;
+    int64_t total = (int64_t)M * N;
+    int64_t n_threads = (total + 3) / 4;
+    int blocks = (int)((n_threads + threads - 1) / threads);
+    if (zp && apply_gelu) {
+        int8_gemm_dequant_kernel<true, true><<<blocks, threads>>>(
+            Y_i32, Y_out, x_scale, w_scale, (int)w_scale_dtype, zp, x_rowsum, bias, M, N);
+    } else if (zp && !apply_gelu) {
+        int8_gemm_dequant_kernel<true, false><<<blocks, threads>>>(
+            Y_i32, Y_out, x_scale, w_scale, (int)w_scale_dtype, zp, x_rowsum, bias, M, N);
+    } else if (!zp && apply_gelu) {
+        int8_gemm_dequant_kernel<false, true><<<blocks, threads>>>(
+            Y_i32, Y_out, x_scale, w_scale, (int)w_scale_dtype, zp, x_rowsum, bias, M, N);
+    } else {
+        int8_gemm_dequant_kernel<false, false><<<blocks, threads>>>(
+            Y_i32, Y_out, x_scale, w_scale, (int)w_scale_dtype, zp, x_rowsum, bias, M, N);
     }
 }
 
@@ -1764,18 +2059,17 @@ void int8_gemm_dequant_cuda(const int32_t* Y_i32, float* Y_out,
                              const void* w_scale, DType w_scale_dtype,
                              const int8_t* zp, const float* x_rowsum,
                              const float* bias, int M, int N) {
-    int threads = 256;
-    int64_t total = (int64_t)M * N;
-    // Each thread handles 4 elements (vectorized or scalar fallback)
-    int64_t n_threads = (total + 3) / 4;
-    int blocks = (int)((n_threads + threads - 1) / threads);
-    if (zp) {
-        int8_gemm_dequant_kernel<true><<<blocks, threads>>>(
-            Y_i32, Y_out, x_scale, w_scale, (int)w_scale_dtype, zp, x_rowsum, bias, M, N);
-    } else {
-        int8_gemm_dequant_kernel<false><<<blocks, threads>>>(
-            Y_i32, Y_out, x_scale, w_scale, (int)w_scale_dtype, zp, x_rowsum, bias, M, N);
-    }
+    int8_gemm_dequant_dispatch(Y_i32, Y_out, x_scale, w_scale, w_scale_dtype,
+                                zp, x_rowsum, bias, M, N, false);
+}
+
+void int8_gemm_dequant_gelu_cuda(const int32_t* Y_i32, float* Y_out,
+                                  const float* x_scale,
+                                  const void* w_scale, DType w_scale_dtype,
+                                  const int8_t* zp, const float* x_rowsum,
+                                  const float* bias, int M, int N) {
+    int8_gemm_dequant_dispatch(Y_i32, Y_out, x_scale, w_scale, w_scale_dtype,
+                                zp, x_rowsum, bias, M, N, true);
 }
 
 // ============================================================================
