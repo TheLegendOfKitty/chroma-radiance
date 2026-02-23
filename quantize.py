@@ -8,9 +8,11 @@ Features:
   --asymmetric     Asymmetric quantization: maps [min,max] to [-128,127] with zero_point
   --smooth ALPHA   SmoothQuant: per-channel weight equalization (alpha in [0,1], recommend 0.5)
   --gptq           GPTQ: second-order optimal rounding using weight Hessian proxy
+  --clip mse       MSE-optimal clipping: grid-search for clip ratio minimizing per-group MSE
+  --awq            AWQ: activation-aware weight quantization (searches optimal scaling alpha)
 
 Usage:
-    python quantize.py input.safetensors output.safetensors [--group-size 128] [--asymmetric] [--smooth 0.5] [--gptq]
+    python quantize.py input.safetensors output.safetensors [--group-size 128] [--asymmetric] [--smooth 0.5] [--gptq] [--clip mse] [--awq]
 """
 
 import argparse
@@ -50,13 +52,15 @@ def compute_smooth_factors(w: torch.Tensor, alpha: float = 0.5,
     return s.clamp(min=1e-5)
 
 
-def compute_group_params(w: torch.Tensor, group_size: int, asymmetric: bool):
+def compute_group_params(w: torch.Tensor, group_size: int, asymmetric: bool,
+                         clip_ratio: torch.Tensor = None):
     """Compute per-group quantization parameters from weight values.
 
     Args:
         w: Weight matrix [N, K] (float32, possibly smoothed)
         group_size: Number of elements per quantization group along K
         asymmetric: If True, use asymmetric [min,max]->[-128,127] mapping
+        clip_ratio: [N, num_groups] optional per-group clip ratios (from MSE search)
     Returns:
         scale: [N, num_groups] float32
         zero_point: [N, num_groups] int8 or None (if symmetric)
@@ -75,10 +79,18 @@ def compute_group_params(w: torch.Tensor, group_size: int, asymmetric: bool):
     if asymmetric:
         min_val = w_groups.amin(dim=2)           # [N, num_groups]
         max_val = w_groups.amax(dim=2)           # [N, num_groups]
+        if clip_ratio is not None:
+            center = (min_val + max_val) / 2
+            half_range = (max_val - min_val) / 2
+            clip_half = half_range * clip_ratio
+            min_val = center - clip_half
+            max_val = center + clip_half
         scale = ((max_val - min_val) / 255.0).clamp(min=1e-10)
         zero_point = (-128.0 - min_val / scale).round().clamp(-128, 127).to(torch.int8)
     else:
         absmax = w_groups.abs().amax(dim=2)      # [N, num_groups]
+        if clip_ratio is not None:
+            absmax = absmax * clip_ratio
         scale = (absmax / 127.0).clamp(min=1e-10)
         zero_point = None
 
@@ -115,6 +127,170 @@ def standard_quantize(w: torch.Tensor, scale: torch.Tensor,
         w_int8 = (w_groups / scale.unsqueeze(2)).round().clamp(-128, 127).to(torch.int8)
 
     return w_int8.reshape(N, K_pad)[:, :K].contiguous()
+
+
+def dequantize_weights(w_int8: torch.Tensor, scale: torch.Tensor,
+                       zero_point, group_size: int) -> torch.Tensor:
+    """Dequantize INT8 weights back to float32.
+
+    Args:
+        w_int8: [N, K] int8 quantized weights
+        scale: [N, num_groups] float32 scales
+        zero_point: [N, num_groups] int8 or None
+        group_size: Group size
+    Returns:
+        w_float: [N, K] float32 reconstructed weights
+    """
+    N, K = w_int8.shape
+    num_groups = scale.shape[1]
+    K_pad = num_groups * group_size
+
+    if K_pad > K:
+        w_padded = F.pad(w_int8.float(), (0, K_pad - K))
+    else:
+        w_padded = w_int8.float()
+
+    w_groups = w_padded.reshape(N, num_groups, group_size)
+
+    if zero_point is not None:
+        w_float = (w_groups - zero_point.unsqueeze(2).float()) * scale.unsqueeze(2)
+    else:
+        w_float = w_groups * scale.unsqueeze(2)
+
+    return w_float.reshape(N, K_pad)[:, :K].contiguous()
+
+
+def find_optimal_clip_ratio(w: torch.Tensor, group_size: int, asymmetric: bool,
+                            n_candidates: int = 100) -> torch.Tensor:
+    """Grid-search for per-group clip ratio that minimizes quantization MSE.
+
+    Instead of using the full absmax range, searches for a clip ratio in [0.5, 1.0]
+    that minimizes the mean squared error between original and dequantized weights
+    per group. Outlier weights are clipped but the remaining values get finer
+    quantization granularity.
+
+    Args:
+        w: Weight matrix [N, K] float32
+        group_size: Group size
+        asymmetric: Whether to use asymmetric quantization
+        n_candidates: Number of clip ratios to evaluate
+    Returns:
+        best_ratio: [N, num_groups] optimal clip ratios
+    """
+    N, K = w.shape
+    num_groups = (K + group_size - 1) // group_size
+    K_pad = num_groups * group_size
+
+    if K_pad > K:
+        w_padded = F.pad(w, (0, K_pad - K))
+    else:
+        w_padded = w
+
+    w_groups = w_padded.reshape(N, num_groups, group_size)
+
+    best_mse = torch.full((N, num_groups), float('inf'), device=w.device)
+    best_ratio = torch.ones(N, num_groups, device=w.device)
+
+    if asymmetric:
+        min_val = w_groups.amin(dim=2)
+        max_val = w_groups.amax(dim=2)
+        center = (min_val + max_val) / 2
+        half_range = ((max_val - min_val) / 2).clamp(min=1e-10)
+    else:
+        absmax = w_groups.abs().amax(dim=2).clamp(min=1e-10)
+
+    for i in range(n_candidates):
+        r = 0.5 + 0.5 * i / max(n_candidates - 1, 1)
+
+        if asymmetric:
+            clip_half = (half_range * r).unsqueeze(2)
+            clip_center = center.unsqueeze(2)
+            clip_min = clip_center - clip_half
+            clip_max = clip_center + clip_half
+            w_clipped = w_groups.clamp(clip_min, clip_max)
+            sc = ((clip_max - clip_min) / 255.0).clamp(min=1e-10)
+            zp = (-128.0 - clip_min / sc).round().clamp(-128, 127)
+            q = (w_clipped / sc + zp).round().clamp(-128, 127)
+            deq = (q - zp) * sc
+        else:
+            clip_max = (absmax * r).unsqueeze(2)
+            w_clipped = w_groups.clamp(-clip_max, clip_max)
+            sc = (clip_max / 127.0).clamp(min=1e-10)
+            q = (w_clipped / sc).round().clamp(-128, 127)
+            deq = q * sc
+
+        mse = (w_groups - deq).pow(2).mean(dim=2)
+
+        improved = mse < best_mse
+        best_mse = torch.where(improved, mse, best_mse)
+        best_ratio = torch.where(improved, r, best_ratio)
+
+    return best_ratio
+
+
+def compute_awq_scales(w: torch.Tensor, act_absmax: torch.Tensor,
+                       group_size: int, asymmetric: bool,
+                       use_clip_mse: bool, n_grid: int = 20) -> tuple:
+    """Search for per-channel AWQ scaling that minimizes activation-weighted quantization error.
+
+    AWQ (Activation-Aware Weight Quantization) searches for the optimal alpha that
+    balances activation and weight magnitude when computing per-channel scaling factors:
+        s[k] = act_absmax[k]^alpha / weight_absmax[k]^(1-alpha)
+
+    The optimal alpha minimizes activation-weighted reconstruction MSE. This uses the
+    same scaling artifact (.smooth) as SmoothQuant but with a searched alpha per layer.
+
+    Args:
+        w: Weight matrix [N, K] float32
+        act_absmax: [K] per-channel activation absmax from calibration
+        group_size: Quantization group size
+        asymmetric: Whether to use asymmetric quantization
+        use_clip_mse: Whether to use MSE-optimal clipping during search
+        n_grid: Number of alpha candidates (alpha = i/n_grid for i=0..n_grid)
+    Returns:
+        (scales, best_alpha, clip_ratio):
+            scales: [K] per-channel scaling factors
+            best_alpha: float, optimal alpha value
+            clip_ratio: [N, num_groups] or None, clip ratios for best alpha
+    """
+    N, K = w.shape
+    w_absmax = w.abs().amax(dim=0).clamp(min=1e-5)  # [K]
+    act_clamped = act_absmax.clamp(min=1e-5)
+
+    best_mse = float('inf')
+    best_alpha = 0.0
+    best_scales = torch.ones(K, device=w.device, dtype=w.dtype)
+    best_clip_ratio = None
+
+    for i in range(n_grid + 1):
+        alpha = i / n_grid
+
+        s = act_clamped.pow(alpha) / w_absmax.pow(1 - alpha)
+        s = s.clamp(min=1e-5)
+
+        w_scaled = w * s.unsqueeze(0)
+
+        # Find optimal clip ratios if requested
+        cr = find_optimal_clip_ratio(w_scaled, group_size, asymmetric) if use_clip_mse else None
+
+        # Quantize and dequantize with current scaling
+        scale, zp = compute_group_params(w_scaled, group_size, asymmetric, cr)
+        w_q = standard_quantize(w_scaled, scale, zp, group_size)
+        w_deq = dequantize_weights(w_q, scale, zp, group_size)
+
+        # Undo scaling to measure error in original weight space
+        w_recon = w_deq / s.unsqueeze(0)
+
+        # Activation-weighted MSE: channels with larger activations matter more
+        mse = ((w - w_recon).pow(2) * act_clamped.unsqueeze(0).pow(2)).mean().item()
+
+        if mse < best_mse:
+            best_mse = mse
+            best_alpha = alpha
+            best_scales = s.clone()
+            best_clip_ratio = cr.clone() if cr is not None else None
+
+    return best_scales, best_alpha, best_clip_ratio
 
 
 def gptq_quantize(w: torch.Tensor, scale: torch.Tensor, zero_point,
@@ -209,7 +385,8 @@ def gptq_quantize(w: torch.Tensor, scale: torch.Tensor, zero_point,
 def quantize_weights(input_path: str, output_path: str, group_size: int = 128,
                      scale_dtype: str = "f32", asymmetric: bool = False,
                      smooth_alpha: float = 0.0, use_gptq: bool = False,
-                     calib_path: str = "") -> None:
+                     calib_path: str = "", use_awq: bool = False,
+                     clip_mode: str = "absmax") -> None:
     print(f"Loading {input_path}...")
     tensors = load_file(input_path)
 
@@ -219,10 +396,13 @@ def quantize_weights(input_path: str, output_path: str, group_size: int = 128,
         calib_data = load_file(calib_path)
         print(f"  Loaded calibration data: {len(calib_data)} tensors")
 
-    # Use GPU if available for GPTQ (Cholesky + matmul much faster)
-    dev = torch.device("cuda" if use_gptq and torch.cuda.is_available() else "cpu")
-    if use_gptq and dev.type == "cuda":
-        print(f"  Using GPU for GPTQ computation")
+    use_clip_mse = (clip_mode == "mse")
+
+    # Use GPU for compute-intensive operations
+    use_gpu = (use_gptq or use_awq or use_clip_mse) and torch.cuda.is_available()
+    dev = torch.device("cuda" if use_gpu else "cpu")
+    if use_gpu:
+        print(f"  Using GPU for computation")
 
     total = len(tensors)
     output = OrderedDict()
@@ -241,27 +421,46 @@ def quantize_weights(input_path: str, output_path: str, group_size: int = 128,
             w = tensor.float()  # [N, K]
             N, K = w.shape
 
-            # Step 1: SmoothQuant channel equalization
+            if use_gpu:
+                w = w.to(dev)
+
+            # Step 1: AWQ or SmoothQuant channel equalization
             smooth = None
-            if smooth_alpha > 0:
+            clip_ratio = None
+            if use_awq:
                 act_abs = calib_data.get(name)
                 if act_abs is not None:
-                    act_abs = act_abs.float()
+                    act_abs = act_abs.float().to(w.device)
+                    smooth, best_alpha, clip_ratio = compute_awq_scales(
+                        w, act_abs, group_size, asymmetric, use_clip_mse)
+                    w = w * smooth.unsqueeze(0)
+            elif smooth_alpha > 0:
+                act_abs = calib_data.get(name)
+                if act_abs is not None:
+                    act_abs = act_abs.float().to(w.device)
                 smooth = compute_smooth_factors(w, smooth_alpha, act_abs)  # [K]
                 w = w * smooth.unsqueeze(0)  # W_smooth[n,k] = W[n,k] * s[k]
 
-            # Step 2: Compute per-group quantization parameters
-            scale, zero_point = compute_group_params(w, group_size, asymmetric)
+            # Step 2: MSE-optimal clipping (if not already done by AWQ)
+            if use_clip_mse and clip_ratio is None:
+                clip_ratio = find_optimal_clip_ratio(w, group_size, asymmetric)
 
-            # Step 3: Quantize (GPTQ or standard round-to-nearest)
+            # Step 3: Compute per-group quantization parameters
+            scale, zero_point = compute_group_params(w, group_size, asymmetric, clip_ratio)
+
+            # Step 4: Quantize (GPTQ or standard round-to-nearest)
             if use_gptq:
-                w_dev = w.to(dev)
-                scale_dev = scale.to(dev)
-                zp_dev = zero_point.to(dev) if zero_point is not None else None
-                w_int8 = gptq_quantize(w_dev, scale_dev, zp_dev, group_size).cpu()
-                del w_dev, scale_dev, zp_dev
+                w_int8 = gptq_quantize(w, scale, zero_point, group_size)
             else:
                 w_int8 = standard_quantize(w, scale, zero_point, group_size)
+
+            # Move results to CPU for storage
+            w_int8 = w_int8.cpu()
+            scale = scale.cpu()
+            if zero_point is not None:
+                zero_point = zero_point.cpu()
+            if smooth is not None:
+                smooth = smooth.cpu()
 
             dt = time.time() - t0
 
@@ -303,7 +502,7 @@ def quantize_weights(input_path: str, output_path: str, group_size: int = 128,
         label = "Q" if is_weight else " "
         extra = ""
         if is_weight:
-            extra = f" ({dt:.1f}s)" if use_gptq else ""
+            extra = f" ({dt:.1f}s)"
         print(f"\r  [{bar}] {i+1}/{total} ({pct*100:.0f}%) {label} {name[:55]:<55}{extra}", end="", flush=True)
 
     mode_parts = []
@@ -311,8 +510,12 @@ def quantize_weights(input_path: str, output_path: str, group_size: int = 128,
         mode_parts.append("asymmetric")
     else:
         mode_parts.append("symmetric")
-    if smooth_alpha > 0:
+    if use_awq:
+        mode_parts.append("AWQ")
+    elif smooth_alpha > 0:
         mode_parts.append(f"smooth={smooth_alpha}")
+    if use_clip_mse:
+        mode_parts.append("clip=mse")
     if use_gptq:
         mode_parts.append("GPTQ")
     mode_str = ", ".join(mode_parts)
@@ -327,8 +530,12 @@ def quantize_weights(input_path: str, output_path: str, group_size: int = 128,
     metadata = {"quantization_group_size": str(group_size), "quantization_scale_dtype": scale_dtype}
     if asymmetric:
         metadata["quantization_asymmetric"] = "true"
-    if smooth_alpha > 0:
+    if use_awq:
+        metadata["quantization_awq"] = "true"
+    elif smooth_alpha > 0:
         metadata["quantization_smooth_alpha"] = str(smooth_alpha)
+    if use_clip_mse:
+        metadata["quantization_clip"] = "mse"
     if use_gptq:
         metadata["quantization_gptq"] = "true"
     save_file(output, output_path, metadata=metadata)
@@ -350,8 +557,12 @@ if __name__ == "__main__":
                         help="SmoothQuant: per-channel weight equalization (alpha in [0,1], recommend 0.5)")
     parser.add_argument("--gptq", action="store_true",
                         help="GPTQ: second-order optimal rounding (uses weight Hessian proxy)")
+    parser.add_argument("--clip", type=str, default="absmax", choices=["absmax", "mse"],
+                        help="Clipping strategy: absmax (default) or mse (grid-search optimal clip ratio)")
+    parser.add_argument("--awq", action="store_true",
+                        help="AWQ: activation-aware weight quantization (searches optimal scaling alpha per layer)")
     parser.add_argument("--calib", type=str, default="", metavar="FILE",
-                        help="Calibration file (safetensors) with per-channel activation absmax for SmoothQuant")
+                        help="Calibration file (safetensors) with per-channel activation absmax")
     args = parser.parse_args()
 
     if args.group_size < 1:
@@ -360,6 +571,13 @@ if __name__ == "__main__":
     if not 0 <= args.smooth <= 1:
         print("Error: --smooth alpha must be in [0, 1]")
         exit(1)
+    if args.awq and args.smooth > 0:
+        print("Error: --awq and --smooth are mutually exclusive (both produce .smooth scaling)")
+        exit(1)
+    if args.awq and not args.calib:
+        print("Error: --awq requires --calib (activation calibration data)")
+        exit(1)
 
     quantize_weights(args.input, args.output, args.group_size, args.scale_dtype,
-                     args.asymmetric, args.smooth, args.gptq, args.calib)
+                     args.asymmetric, args.smooth, args.gptq, args.calib,
+                     args.awq, args.clip)
