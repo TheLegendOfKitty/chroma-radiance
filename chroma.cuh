@@ -82,6 +82,14 @@ static Tensor load_weight(const SafetensorsFile& sf, const std::string& name) {
             // Per-channel (legacy): group_size = K (entire row is one group)
             w.quant_group_size = (int)w.shape[1];
         }
+        // Load companion zero_point tensor (asymmetric quantization)
+        std::string zp_name = name + ".zp";
+        if (sf.has_tensor(zp_name)) {
+            Tensor zp_t = sf.load_tensor_native(zp_name);
+            assert(zp_t.dtype == DType::INT8);
+            w.quant_zero_points = zp_t.data;
+            zp_t.owns_data = false;  // arena owns memory
+        }
     }
     return w;
 }
@@ -509,13 +517,17 @@ struct ChromaRadiance {
             size_t row_bytes = ncols * dtype_size(parent.dtype);
             if (parent.dtype == DType::INT8) {
                 int num_groups = (int)((ncols + parent.quant_group_size - 1) / parent.quant_group_size);
-                return Tensor::wrap_gpu_int8(
+                auto t = Tensor::wrap_gpu_int8(
                     (char*)parent.data + row_bytes * row_off, {nrows, ncols},
                     parent.quant_scales
                         ? (char*)parent.quant_scales + (int64_t)row_off * num_groups * dtype_size(parent.quant_scales_dtype)
                         : nullptr,
                     parent.quant_scales_dtype,
                     parent.quant_group_size);
+                if (parent.quant_zero_points) {
+                    t.quant_zero_points = (char*)parent.quant_zero_points + row_off * num_groups;
+                }
+                return t;
             }
             return Tensor::wrap_gpu(
                 (char*)parent.data + row_bytes * row_off, {nrows, ncols}, parent.dtype);
@@ -641,13 +653,17 @@ struct ChromaRadiance {
             size_t row_bytes = ncols * dtype_size(parent.dtype);
             if (parent.dtype == DType::INT8) {
                 int num_groups = (int)((ncols + parent.quant_group_size - 1) / parent.quant_group_size);
-                return Tensor::wrap_gpu_int8(
+                auto t = Tensor::wrap_gpu_int8(
                     (char*)parent.data + row_bytes * row_off, {nrows, ncols},
                     parent.quant_scales
                         ? (char*)parent.quant_scales + (int64_t)row_off * num_groups * dtype_size(parent.quant_scales_dtype)
                         : nullptr,
                     parent.quant_scales_dtype,
                     parent.quant_group_size);
+                if (parent.quant_zero_points) {
+                    t.quant_zero_points = (char*)parent.quant_zero_points + row_off * num_groups;
+                }
+                return t;
             }
             return Tensor::wrap_gpu(
                 (char*)parent.data + row_bytes * row_off, {nrows, ncols}, parent.dtype);

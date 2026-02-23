@@ -77,11 +77,28 @@ static void linear_lt(int64_t M, int64_t K, int64_t N,
     cublasLtMatmulDescDestroy(matmul_desc);
 }
 
+// INT8 x INT8 → INT32 GEMM via cublasGemmEx with INT8 tensor cores
+// Y_int32[M,N] = X_int8[M,K] @ W_int8[N,K]^T
+static void linear_int8_gemm(int64_t M, int64_t K, int64_t N,
+                               const int8_t* x_int8, const int8_t* w_int8,
+                               int32_t* Y_int32) {
+    int32_t alpha = 1, beta = 0;
+    CHECK_CUBLAS(cublasGemmEx(g_cublas,
+        CUBLAS_OP_T, CUBLAS_OP_N,
+        (int)N, (int)M, (int)K,
+        &alpha,
+        w_int8, CUDA_R_8I, (int)K,
+        x_int8, CUDA_R_8I, (int)K,
+        &beta,
+        Y_int32, CUDA_R_32I, (int)N,
+        CUBLAS_COMPUTE_32I, CUBLAS_GEMM_DEFAULT));
+}
+
 // Linear: output = x @ W^T + bias
 // x: [M, K], W: [N, K], bias: [N] or null, output: [M, N]
 // All stored row-major. Uses F32 accumulation.
 // Bias is fused into the GEMM epilogue via cublasLt (zero extra kernel launches).
-// INT8 weights: dequantized to BF16 with per-group scales, then BF16 GEMM.
+// INT8 weights: per-channel asymmetric uses INT8 GEMM, otherwise fused dequant + BF16 WMMA.
 static void linear(const Tensor& x, const Tensor& W, const Tensor* bias, Tensor& output) {
     assert(x.on_gpu && W.on_gpu && output.on_gpu);
     assert(x.ndim >= 1 && W.ndim == 2);
@@ -94,7 +111,7 @@ static void linear(const Tensor& x, const Tensor& W, const Tensor* bias, Tensor&
 
     const void* bias_data = (bias && bias->on_gpu && bias->dtype == DType::F32) ? bias->data : nullptr;
 
-    // INT8 weight path: fused dequant + WMMA GEMM (no N*K temp buffer)
+    // INT8 weight path
     if (W.dtype == DType::INT8) {
         assert(W.quant_scales && W.quant_group_size > 0 && "INT8 weight missing quant_scales or group_size");
 
@@ -116,8 +133,32 @@ static void linear(const Tensor& x, const Tensor& W, const Tensor* bias, Tensor&
             exit(1);
         }
 
-        // Fused INT8 dequant + BF16 GEMM (eliminates N*K temp buffer)
+        // Per-channel asymmetric: INT8 GEMM path (uses INT8 tensor cores, 2x BF16 throughput)
+        // Decomposition: Y = x_scale * w_scale * (X_i8 @ W_i8^T - zp * x_rowsum) + bias
+        // Requires K%4==0 for cuBLAS INT8 tensor cores; falls through to WMMA otherwise
+        if (W.quant_zero_points && W.quant_group_size >= (int)K && K % 4 == 0) {
+            Tensor x_int8 = Tensor::alloc({M, K}, DType::INT8, true);
+            Tensor x_scale = Tensor::alloc({M}, DType::F32, true);
+            Tensor x_rowsum = Tensor::alloc({M}, DType::F32, true);
+            quantize_activations_int8_cuda(x_bf16, x_int8.i8(), x_scale.f32(), x_rowsum.f32(),
+                                            (int)M, (int)K);
+
+            // INT8 GEMM → INT32 accumulation buffer
+            Tensor y_i32 = Tensor::alloc({M, N}, DType::F32, true);  // 4 bytes/elem, same as INT32
+            linear_int8_gemm(M, K, N, x_int8.i8(), W.i8(), (int32_t*)y_i32.data);
+
+            // Dequant: Y_f32 = x_scale * w_scale * (Y_i32 - zp * x_rowsum) + bias
+            int8_gemm_dequant_cuda((const int32_t*)y_i32.data, output.f32(),
+                                    x_scale.f32(),
+                                    W.quant_scales, W.quant_scales_dtype,
+                                    (const int8_t*)W.quant_zero_points, x_rowsum.f32(),
+                                    (const float*)bias_data, (int)M, (int)N);
+            return;
+        }
+
+        // Fused INT8 dequant + BF16 WMMA GEMM (per-group or symmetric per-channel)
         fused_dequant_gemm_cuda(x_bf16, W.i8(), W.quant_scales, W.quant_scales_dtype,
+                                (const int8_t*)W.quant_zero_points,
                                 (const float*)bias_data, output.f32(),
                                 (int)M, (int)N, (int)K, W.quant_group_size);
         return;

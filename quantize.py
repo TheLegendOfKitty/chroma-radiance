@@ -5,7 +5,7 @@ Converts BF16 weight matrices to INT8 with per-group scales.
 Non-weight tensors (biases, norms, embeddings) are copied unchanged.
 
 Usage:
-    python quantize.py input.safetensors output-int8.safetensors [--group-size 128] [--scale-dtype bf16]
+    python quantize.py input.safetensors output-int8.safetensors [--group-size 128] [--scale-dtype bf16] [--asymmetric]
 """
 
 import argparse
@@ -16,7 +16,7 @@ from collections import OrderedDict
 
 
 def quantize_weights(input_path: str, output_path: str, group_size: int = 128,
-                     scale_dtype: str = "f32") -> None:
+                     scale_dtype: str = "f32", asymmetric: bool = False) -> None:
     print(f"Loading {input_path}...")
     tensors = load_file(input_path)
 
@@ -48,13 +48,24 @@ def quantize_weights(input_path: str, output_path: str, group_size: int = 128,
             # Reshape into groups: [N, num_groups, group_size]
             w_groups = w_padded.reshape(N, num_groups, group_size)
 
-            # Per-group absmax
-            absmax = w_groups.abs().amax(dim=2)           # [N, num_groups]
-            scale = (absmax / 127.0).clamp(min=1e-10)     # [N, num_groups]
+            if asymmetric:
+                # Asymmetric quantization: maps [min, max] to [-128, 127]
+                min_val = w_groups.amin(dim=2)           # [N, num_groups]
+                max_val = w_groups.amax(dim=2)           # [N, num_groups]
+                scale = ((max_val - min_val) / 255.0).clamp(min=1e-10)  # [N, num_groups]
+                zero_point = (-128.0 - min_val / scale).round().clamp(-128, 127).to(torch.int8)  # [N, num_groups]
 
-            # Quantize
-            w_int8 = (w_groups / scale.unsqueeze(2)).round().clamp(-128, 127).to(torch.int8)
-            w_int8 = w_int8.reshape(N, K_pad)[:, :K].contiguous()  # Trim padding
+                # Quantize: w_int8 = clamp(round(w / scale + zp), -128, 127)
+                w_int8 = (w_groups / scale.unsqueeze(2) + zero_point.unsqueeze(2).float()).round().clamp(-128, 127).to(torch.int8)
+                w_int8 = w_int8.reshape(N, K_pad)[:, :K].contiguous()  # Trim padding
+            else:
+                # Symmetric quantization: maps [-absmax, absmax] to [-127, 127]
+                absmax = w_groups.abs().amax(dim=2)           # [N, num_groups]
+                scale = (absmax / 127.0).clamp(min=1e-10)     # [N, num_groups]
+
+                # Quantize
+                w_int8 = (w_groups / scale.unsqueeze(2)).round().clamp(-128, 127).to(torch.int8)
+                w_int8 = w_int8.reshape(N, K_pad)[:, :K].contiguous()  # Trim padding
 
             if scale_dtype == "f32":
                 scale_out = scale
@@ -70,6 +81,11 @@ def quantize_weights(input_path: str, output_path: str, group_size: int = 128,
 
             quantized_bytes += w_int8.nelement() * w_int8.element_size()
             quantized_bytes += scale_out.nelement() * scale_out.element_size()
+
+            if asymmetric:
+                output[name + ".zp"] = zero_point          # [N, num_groups] INT8
+                quantized_bytes += zero_point.nelement() * zero_point.element_size()
+
             n_quantized += 1
         else:
             output[name] = tensor
@@ -84,14 +100,17 @@ def quantize_weights(input_path: str, output_path: str, group_size: int = 128,
         label = "Q" if is_weight else " "
         print(f"\r  [{bar}] {i+1}/{total} ({pct*100:.0f}%) {label} {name[:60]:<60}", end="", flush=True)
 
+    mode_str = "asymmetric" if asymmetric else "symmetric"
     print()
-    print(f"\nQuantized {n_quantized} weight matrices (group_size={group_size}, scale_dtype={scale_dtype}), copied {n_copied} other tensors")
+    print(f"\nQuantized {n_quantized} weight matrices ({mode_str}, group_size={group_size}, scale_dtype={scale_dtype}), copied {n_copied} other tensors")
     print(f"Original size:  {original_bytes / 1e9:.2f} GB")
     print(f"Quantized size: {quantized_bytes / 1e9:.2f} GB")
     print(f"Reduction:      {(1 - quantized_bytes / original_bytes) * 100:.1f}%")
 
     print(f"\nSaving to {output_path}...")
     metadata = {"quantization_group_size": str(group_size), "quantization_scale_dtype": scale_dtype}
+    if asymmetric:
+        metadata["quantization_asymmetric"] = "true"
     save_file(output, output_path, metadata=metadata)
     print("Done.")
 
@@ -105,10 +124,12 @@ if __name__ == "__main__":
     parser.add_argument("--scale-dtype", type=str, default="f32",
                         choices=["f32", "fp16", "bf16"],
                         help="Storage dtype for quant scales (default: f32)")
+    parser.add_argument("--asymmetric", action="store_true",
+                        help="Use asymmetric quantization (maps [min,max] to [-128,127] with zero_point)")
     args = parser.parse_args()
 
     if args.group_size < 1:
         print("Error: --group-size must be >= 1")
         exit(1)
 
-    quantize_weights(args.input, args.output, args.group_size, args.scale_dtype)
+    quantize_weights(args.input, args.output, args.group_size, args.scale_dtype, args.asymmetric)

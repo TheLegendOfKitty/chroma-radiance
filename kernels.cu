@@ -1327,6 +1327,116 @@ void dequant_int8_to_bf16_cuda(const int8_t* src, const void* scales, DType scal
 }
 
 // ============================================================================
+// Dynamic INT8 activation quantization for INT8 GEMM path
+// Per-row symmetric: x_int8 = round(x * 127/absmax), x_scale = absmax/127
+// Also computes row sums of x_int8 for asymmetric weight dequant correction:
+//   Y[m,n] = x_scale[m] * w_scale[n] * (GEMM[m,n] - zp[n] * x_rowsum[m])
+// ============================================================================
+
+__global__ void quantize_activations_kernel(
+    const __nv_bfloat16* __restrict__ X,   // [M, K]
+    int8_t* __restrict__ X_int8,           // [M, K]
+    float* __restrict__ x_scale,           // [M]
+    float* __restrict__ x_rowsum,          // [M] (float-cast of int sum)
+    int M, int K)
+{
+    int row = blockIdx.x;
+    if (row >= M) return;
+    const __nv_bfloat16* x_row = X + (int64_t)row * K;
+    int8_t* out_row = X_int8 + (int64_t)row * K;
+
+    extern __shared__ char qsmem[];
+    float* fdata = reinterpret_cast<float*>(qsmem);
+
+    // Pass 1: find per-row absmax
+    float local_max = 0.0f;
+    for (int k = threadIdx.x; k < K; k += blockDim.x) {
+        float v = fabsf(__bfloat162float(x_row[k]));
+        local_max = fmaxf(local_max, v);
+    }
+    fdata[threadIdx.x] = local_max;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < (unsigned)s)
+            fdata[threadIdx.x] = fmaxf(fdata[threadIdx.x], fdata[threadIdx.x + s]);
+        __syncthreads();
+    }
+    float absmax = fdata[0];
+    float inv_scale = (absmax > 1e-10f) ? 127.0f / absmax : 0.0f;
+    if (threadIdx.x == 0) x_scale[row] = absmax / 127.0f;
+    __syncthreads();
+
+    // Pass 2: quantize to INT8 and accumulate row sum
+    int local_sum = 0;
+    for (int k = threadIdx.x; k < K; k += blockDim.x) {
+        float v = __bfloat162float(x_row[k]);
+        int q = __float2int_rn(v * inv_scale);
+        q = max(-128, min(127, q));
+        out_row[k] = (int8_t)q;
+        local_sum += q;
+    }
+    int* idata = reinterpret_cast<int*>(qsmem);
+    idata[threadIdx.x] = local_sum;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < (unsigned)s)
+            idata[threadIdx.x] += idata[threadIdx.x + s];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) x_rowsum[row] = (float)idata[0];
+}
+
+void quantize_activations_int8_cuda(const __nv_bfloat16* X, int8_t* X_int8,
+                                     float* x_scale, float* x_rowsum,
+                                     int M, int K) {
+    int threads = 256;
+    quantize_activations_kernel<<<M, threads, threads * sizeof(float)>>>(
+        X, X_int8, x_scale, x_rowsum, M, K);
+}
+
+// ============================================================================
+// Post-process INT8 GEMM: apply dequant correction + bias
+// Y[m,n] = x_scale[m] * w_scale[n] * (Y[m,n] - zp[n] * x_rowsum[m]) + bias[n]
+// ============================================================================
+
+__global__ void int8_gemm_dequant_kernel(
+    const int32_t* __restrict__ Y_i32,        // [M, N] INT32 from GEMM
+    float* __restrict__ Y_out,                // [M, N] F32 output
+    const float* __restrict__ x_scale,        // [M]
+    const void* __restrict__ w_scale,         // [N] F32/FP16/BF16
+    int w_scale_dtype,
+    const int8_t* __restrict__ zp,            // [N] or nullptr
+    const float* __restrict__ x_rowsum,       // [M]
+    const float* __restrict__ bias,           // [N] or nullptr
+    int M, int N)
+{
+    int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= (int64_t)M * N) return;
+    int m = (int)(idx / N);
+    int n = (int)(idx % N);
+
+    float raw = (float)Y_i32[idx];
+    float xs = x_scale[m];
+    float ws = load_quant_scale_device(w_scale, w_scale_dtype, (int64_t)n);
+    float correction = zp ? (float)zp[n] * x_rowsum[m] : 0.0f;
+    float val = xs * ws * (raw - correction);
+    if (bias) val += bias[n];
+    Y_out[idx] = val;
+}
+
+void int8_gemm_dequant_cuda(const int32_t* Y_i32, float* Y_out,
+                             const float* x_scale,
+                             const void* w_scale, DType w_scale_dtype,
+                             const int8_t* zp, const float* x_rowsum,
+                             const float* bias, int M, int N) {
+    int threads = 256;
+    int64_t total = (int64_t)M * N;
+    int blocks = (int)((total + threads - 1) / threads);
+    int8_gemm_dequant_kernel<<<blocks, threads>>>(
+        Y_i32, Y_out, x_scale, w_scale, (int)w_scale_dtype, zp, x_rowsum, bias, M, N);
+}
+
+// ============================================================================
 // Fused INT8 Dequant + BF16 WMMA GEMM
 // Y[M,N] = X[M,K] @ W[N,K]^T + bias[N]
 //
@@ -1374,6 +1484,7 @@ __global__ void fused_dequant_gemm_kernel_t(
     const int8_t* __restrict__ W,            // [N, K] row-major INT8
     const void* __restrict__ scales,         // [N, num_groups] F32/FP16/BF16
     int scales_dtype,
+    const int8_t* __restrict__ zero_points,  // [N, num_groups] INT8 or nullptr (symmetric)
     const float* __restrict__ bias,          // [N] F32 or nullptr
     float* __restrict__ Y,                   // [M, N] row-major F32
     int M, int N, int K, int group_size,
@@ -1404,6 +1515,7 @@ __global__ void fused_dequant_gemm_kernel_t(
     __nv_bfloat16* smem_x = smem_base;
     __nv_bfloat16* smem_w = smem_x + FUSED_BM * STRIDE;
     float* smem_scales = reinterpret_cast<float*>(smem_w + FUSED_BN * STRIDE);
+    float* smem_zp = smem_scales + FUSED_BN;
 
     auto load_x_tile = [&](int k_start) {
         __nv_bfloat16* sx = smem_x;
@@ -1466,22 +1578,29 @@ __global__ void fused_dequant_gemm_kernel_t(
 
                 if constexpr (GROUP_SIZE_CONST == 128 || GROUP_SIZE_CONST == -1) {
                     float s = smem_scales[local_n];
-                    store_dequant4(dst + 0,  (float)q[0]*s,  (float)q[1]*s,  (float)q[2]*s,  (float)q[3]*s);
-                    store_dequant4(dst + 4,  (float)q[4]*s,  (float)q[5]*s,  (float)q[6]*s,  (float)q[7]*s);
-                    store_dequant4(dst + 8,  (float)q[8]*s,  (float)q[9]*s,  (float)q[10]*s, (float)q[11]*s);
-                    store_dequant4(dst + 12, (float)q[12]*s, (float)q[13]*s, (float)q[14]*s, (float)q[15]*s);
+                    float z = smem_zp[local_n];
+                    store_dequant4(dst + 0,  ((float)q[0]-z)*s,  ((float)q[1]-z)*s,  ((float)q[2]-z)*s,  ((float)q[3]-z)*s);
+                    store_dequant4(dst + 4,  ((float)q[4]-z)*s,  ((float)q[5]-z)*s,  ((float)q[6]-z)*s,  ((float)q[7]-z)*s);
+                    store_dequant4(dst + 8,  ((float)q[8]-z)*s,  ((float)q[9]-z)*s,  ((float)q[10]-z)*s, ((float)q[11]-z)*s);
+                    store_dequant4(dst + 12, ((float)q[12]-z)*s, ((float)q[13]-z)*s, ((float)q[14]-z)*s, ((float)q[15]-z)*s);
                 } else {
                     int64_t scale_base = (int64_t)gn * num_groups;
                     #pragma unroll
                     for (int i = 0; i < 16; i += 4) {
                         int gki = gk + i;
-                        float s0 = load_quant_scale_device(scales, scales_dtype, scale_base + gki / group_size);
-                        float s1 = load_quant_scale_device(scales, scales_dtype, scale_base + (gki+1) / group_size);
-                        float s2 = load_quant_scale_device(scales, scales_dtype, scale_base + (gki+2) / group_size);
-                        float s3 = load_quant_scale_device(scales, scales_dtype, scale_base + (gki+3) / group_size);
+                        int gi0 = gki / group_size, gi1 = (gki+1) / group_size;
+                        int gi2 = (gki+2) / group_size, gi3 = (gki+3) / group_size;
+                        float s0 = load_quant_scale_device(scales, scales_dtype, scale_base + gi0);
+                        float s1 = load_quant_scale_device(scales, scales_dtype, scale_base + gi1);
+                        float s2 = load_quant_scale_device(scales, scales_dtype, scale_base + gi2);
+                        float s3 = load_quant_scale_device(scales, scales_dtype, scale_base + gi3);
+                        float z0 = zero_points ? (float)zero_points[scale_base + gi0] : 0.0f;
+                        float z1 = zero_points ? (float)zero_points[scale_base + gi1] : 0.0f;
+                        float z2 = zero_points ? (float)zero_points[scale_base + gi2] : 0.0f;
+                        float z3 = zero_points ? (float)zero_points[scale_base + gi3] : 0.0f;
                         store_dequant4(dst + i,
-                                       (float)q[i]*s0, (float)q[i+1]*s1,
-                                       (float)q[i+2]*s2, (float)q[i+3]*s3);
+                                       ((float)q[i]-z0)*s0, ((float)q[i+1]-z1)*s1,
+                                       ((float)q[i+2]-z2)*s2, ((float)q[i+3]-z3)*s3);
                     }
                 }
             }
@@ -1499,18 +1618,25 @@ __global__ void fused_dequant_gemm_kernel_t(
                     int8_t q0 = src[0], q1 = src[1], q2 = src[2], q3 = src[3];
                     if constexpr (GROUP_SIZE_CONST == 128 || GROUP_SIZE_CONST == -1) {
                         float s = smem_scales[local_n];
+                        float z = smem_zp[local_n];
                         store_dequant4(dst,
-                                       (float)q0 * s, (float)q1 * s,
-                                       (float)q2 * s, (float)q3 * s);
+                                       ((float)q0-z) * s, ((float)q1-z) * s,
+                                       ((float)q2-z) * s, ((float)q3-z) * s);
                     } else {
                         int64_t scale_base = (int64_t)gn * num_groups;
-                        float s0 = load_quant_scale_device(scales, scales_dtype, scale_base + (gk + 0) / group_size);
-                        float s1 = load_quant_scale_device(scales, scales_dtype, scale_base + (gk + 1) / group_size);
-                        float s2 = load_quant_scale_device(scales, scales_dtype, scale_base + (gk + 2) / group_size);
-                        float s3 = load_quant_scale_device(scales, scales_dtype, scale_base + (gk + 3) / group_size);
+                        int gi0 = (gk + 0) / group_size, gi1 = (gk + 1) / group_size;
+                        int gi2 = (gk + 2) / group_size, gi3 = (gk + 3) / group_size;
+                        float s0 = load_quant_scale_device(scales, scales_dtype, scale_base + gi0);
+                        float s1 = load_quant_scale_device(scales, scales_dtype, scale_base + gi1);
+                        float s2 = load_quant_scale_device(scales, scales_dtype, scale_base + gi2);
+                        float s3 = load_quant_scale_device(scales, scales_dtype, scale_base + gi3);
+                        float z0 = zero_points ? (float)zero_points[scale_base + gi0] : 0.0f;
+                        float z1 = zero_points ? (float)zero_points[scale_base + gi1] : 0.0f;
+                        float z2 = zero_points ? (float)zero_points[scale_base + gi2] : 0.0f;
+                        float z3 = zero_points ? (float)zero_points[scale_base + gi3] : 0.0f;
                         store_dequant4(dst,
-                                       (float)q0 * s0, (float)q1 * s1,
-                                       (float)q2 * s2, (float)q3 * s3);
+                                       ((float)q0-z0) * s0, ((float)q1-z1) * s1,
+                                       ((float)q2-z2) * s2, ((float)q3-z3) * s3);
                     }
                 } else {
                     #pragma unroll
@@ -1519,14 +1645,16 @@ __global__ void fused_dequant_gemm_kernel_t(
                         __nv_bfloat16 v = __float2bfloat16(0.0f);
                         if (gn < N && kk < K) {
                             int8_t q = W[(int64_t)gn * K + kk];
-                            float s;
+                            float s, z;
                             if constexpr (GROUP_SIZE_CONST == 128 || GROUP_SIZE_CONST == -1) {
                                 s = smem_scales[local_n];
+                                z = smem_zp[local_n];
                             } else {
-                                s = load_quant_scale_device(scales, scales_dtype,
-                                                              (int64_t)gn * num_groups + kk / group_size);
+                                int64_t gi = (int64_t)gn * num_groups + kk / group_size;
+                                s = load_quant_scale_device(scales, scales_dtype, gi);
+                                z = zero_points ? (float)zero_points[gi] : 0.0f;
                             }
-                            v = __float2bfloat16((float)q * s);
+                            v = __float2bfloat16(((float)q - z) * s);
                         }
                         dst[t] = v;
                     }
@@ -1577,8 +1705,10 @@ __global__ void fused_dequant_gemm_kernel_t(
     if constexpr (GROUP_SIZE_CONST == -1) {
         if (tid < FUSED_BN) {
             int gn = block_n + tid;
-            if (FULL_TILE || gn < N)
+            if (FULL_TILE || gn < N) {
                 smem_scales[tid] = load_quant_scale_device(scales, scales_dtype, (int64_t)gn);
+                smem_zp[tid] = zero_points ? (float)zero_points[gn] : 0.0f;
+            }
         }
         __syncthreads();
     }
@@ -1593,8 +1723,9 @@ __global__ void fused_dequant_gemm_kernel_t(
                 if (group != cached_group) {
                     if (tid < FUSED_BN) {
                         int gn = block_n + tid;
-                        smem_scales[tid] = load_quant_scale_device(scales, scales_dtype,
-                                                                    (int64_t)gn * num_groups + group);
+                        int64_t gi = (int64_t)gn * num_groups + group;
+                        smem_scales[tid] = load_quant_scale_device(scales, scales_dtype, gi);
+                        smem_zp[tid] = zero_points ? (float)zero_points[gi] : 0.0f;
                     }
                     cached_group = group;
                     __syncthreads();
@@ -1617,9 +1748,11 @@ __global__ void fused_dequant_gemm_kernel_t(
                 if (group != cached_group) {
                     if (tid < FUSED_BN) {
                         int gn = block_n + tid;
-                        if (FULL_TILE || gn < N)
-                            smem_scales[tid] = load_quant_scale_device(scales, scales_dtype,
-                                                                        (int64_t)gn * num_groups + group);
+                        if (FULL_TILE || gn < N) {
+                            int64_t gi = (int64_t)gn * num_groups + group;
+                            smem_scales[tid] = load_quant_scale_device(scales, scales_dtype, gi);
+                            smem_zp[tid] = zero_points ? (float)zero_points[gi] : 0.0f;
+                        }
                     }
                     cached_group = group;
                     __syncthreads();
@@ -1698,6 +1831,7 @@ __global__ void fused_dequant_gemm_kernel_t(
 template<int BK, int GROUP_SIZE_CONST>
 static void launch_fused_dequant_gemm_variant(const __nv_bfloat16* X, const int8_t* W,
                                               const void* scales, DType scales_dtype,
+                                              const int8_t* zero_points,
                                               const float* bias, float* Y,
                                               int M, int N, int K, int group_size) {
     dim3 grid_all((N + FUSED_BN - 1) / FUSED_BN, (M + FUSED_BM - 1) / FUSED_BM);
@@ -1705,7 +1839,8 @@ static void launch_fused_dequant_gemm_variant(const __nv_bfloat16* X, const int8
 
     const size_t out_smem = (size_t)FUSED_BM * (FUSED_BN + 2) * sizeof(float);
     const size_t tile_smem_single = (size_t)(FUSED_BM + FUSED_BN) * (BK + FUSED_PAD) * sizeof(__nv_bfloat16)
-                                  + (size_t)FUSED_BN * sizeof(float);
+                                  + (size_t)FUSED_BN * sizeof(float)    // scales
+                                  + (size_t)FUSED_BN * sizeof(float);   // zero_points
     const size_t smem_edge = tile_smem_single > out_smem ? tile_smem_single : out_smem;
     const size_t smem_full = tile_smem_single > out_smem ? tile_smem_single : out_smem;
 
@@ -1717,31 +1852,33 @@ static void launch_fused_dequant_gemm_variant(const __nv_bfloat16* X, const int8
         dim3 grid_full(full_n, full_m);
         fused_dequant_gemm_kernel_t<BK, GROUP_SIZE_CONST, true, true>
             <<<grid_full, block, smem_full>>>(
-                X, W, scales, (int)scales_dtype, bias, Y, M, N, K, group_size, 0, 0);
+                X, W, scales, (int)scales_dtype, zero_points, bias, Y, M, N, K, group_size, 0, 0);
     }
 
     if (full_n != (int)grid_all.x || full_m != (int)grid_all.y) {
         fused_dequant_gemm_kernel_t<BK, GROUP_SIZE_CONST, false, false>
             <<<grid_all, block, smem_edge>>>(
-                X, W, scales, (int)scales_dtype, bias, Y, M, N, K, group_size, full_n, full_m);
+                X, W, scales, (int)scales_dtype, zero_points, bias, Y, M, N, K, group_size, full_n, full_m);
     } else if (full_n == 0 || full_m == 0) {
         fused_dequant_gemm_kernel_t<BK, GROUP_SIZE_CONST, false, false>
             <<<grid_all, block, smem_edge>>>(
-                X, W, scales, (int)scales_dtype, bias, Y, M, N, K, group_size, 0, 0);
+                X, W, scales, (int)scales_dtype, zero_points, bias, Y, M, N, K, group_size, 0, 0);
     }
 }
 
 void fused_dequant_gemm_cuda(const __nv_bfloat16* X, const int8_t* W,
-                              const void* scales, DType scales_dtype, const float* bias,
+                              const void* scales, DType scales_dtype,
+                              const int8_t* zero_points,
+                              const float* bias,
                               float* Y, int M, int N, int K, int group_size) {
     // Lightweight heuristic "autotune": prefer BK=64 on larger, aligned problems.
     bool use_bk64 = (K % 64 == 0) && (K >= 256) && (M >= 32) && (N >= 32);
 
     if (group_size == 128) {
         if (use_bk64) {
-            launch_fused_dequant_gemm_variant<64, 128>(X, W, scales, scales_dtype, bias, Y, M, N, K, group_size);
+            launch_fused_dequant_gemm_variant<64, 128>(X, W, scales, scales_dtype, zero_points, bias, Y, M, N, K, group_size);
         } else {
-            launch_fused_dequant_gemm_variant<32, 128>(X, W, scales, scales_dtype, bias, Y, M, N, K, group_size);
+            launch_fused_dequant_gemm_variant<32, 128>(X, W, scales, scales_dtype, zero_points, bias, Y, M, N, K, group_size);
         }
         return;
     }
@@ -1749,17 +1886,17 @@ void fused_dequant_gemm_cuda(const __nv_bfloat16* X, const int8_t* W,
     // Legacy per-channel scales (single scale per row) benefit from a dedicated specialization.
     if (group_size >= K) {
         if (use_bk64) {
-            launch_fused_dequant_gemm_variant<64, -1>(X, W, scales, scales_dtype, bias, Y, M, N, K, group_size);
+            launch_fused_dequant_gemm_variant<64, -1>(X, W, scales, scales_dtype, zero_points, bias, Y, M, N, K, group_size);
         } else {
-            launch_fused_dequant_gemm_variant<32, -1>(X, W, scales, scales_dtype, bias, Y, M, N, K, group_size);
+            launch_fused_dequant_gemm_variant<32, -1>(X, W, scales, scales_dtype, zero_points, bias, Y, M, N, K, group_size);
         }
         return;
     }
 
     if (use_bk64) {
-        launch_fused_dequant_gemm_variant<64, 0>(X, W, scales, scales_dtype, bias, Y, M, N, K, group_size);
+        launch_fused_dequant_gemm_variant<64, 0>(X, W, scales, scales_dtype, zero_points, bias, Y, M, N, K, group_size);
     } else {
-        launch_fused_dequant_gemm_variant<32, 0>(X, W, scales, scales_dtype, bias, Y, M, N, K, group_size);
+        launch_fused_dequant_gemm_variant<32, 0>(X, W, scales, scales_dtype, zero_points, bias, Y, M, N, K, group_size);
     }
 }
 

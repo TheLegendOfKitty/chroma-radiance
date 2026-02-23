@@ -138,6 +138,7 @@ struct Tensor {
     void* quant_scales = nullptr;   // per-group scales for INT8 weights (GPU, arena-owned)
     DType quant_scales_dtype = DType::F32;
     int quant_group_size = 0;       // 0 = not quantized, >0 = per-group scale granularity
+    void* quant_zero_points = nullptr;  // [N] or [N, num_groups] INT8, nullptr = symmetric
     int64_t shape[4] = {0, 0, 0, 0};
     int64_t stride[4] = {0, 0, 0, 0};  // in elements
     int ndim = 0;
@@ -153,6 +154,7 @@ struct Tensor {
         o.data = nullptr;
         o.quant_scales = nullptr;
         o.quant_scales_dtype = DType::F32;
+        o.quant_zero_points = nullptr;
         o.owns_data = false;
     }
     Tensor& operator=(Tensor&& o) noexcept {
@@ -162,6 +164,7 @@ struct Tensor {
             o.data = nullptr;
             o.quant_scales = nullptr;
             o.quant_scales_dtype = DType::F32;
+            o.quant_zero_points = nullptr;
             o.owns_data = false;
         }
         return *this;
@@ -184,6 +187,7 @@ struct Tensor {
         data = nullptr;
         quant_scales = nullptr;
         quant_scales_dtype = DType::F32;
+        quant_zero_points = nullptr;
         owns_data = false;
     }
 
@@ -350,6 +354,7 @@ struct Tensor {
         t.quant_scales = quant_scales;
         t.quant_scales_dtype = quant_scales_dtype;
         t.quant_group_size = quant_group_size;
+        t.quant_zero_points = quant_zero_points;
         t.ndim = (int)new_shape.size();
         t.dtype = dtype;
         t.on_gpu = on_gpu;
@@ -379,6 +384,16 @@ struct Tensor {
         }
         t.quant_scales_dtype = quant_scales_dtype;
         t.quant_group_size = quant_group_size;
+        if (quant_zero_points) {
+            if (quant_group_size > 0 && ndim >= 2) {
+                int num_groups_zp = (int)((shape[1] + quant_group_size - 1) / quant_group_size);
+                t.quant_zero_points = (char*)quant_zero_points + start * num_groups_zp;
+            } else {
+                t.quant_zero_points = (char*)quant_zero_points + start;
+            }
+        } else {
+            t.quant_zero_points = nullptr;
+        }
         t.ndim = ndim;
         for (int i = 0; i < ndim; i++) {
             t.shape[i] = (i == 0) ? count : shape[i];
@@ -422,10 +437,23 @@ void dequant_int8_to_bf16_cuda(const int8_t* src, const void* scales, DType scal
                                 __nv_bfloat16* dst, int64_t N, int64_t K,
                                 int group_size);
 
+// Dynamic INT8 activation quantization for INT8 GEMM path
+void quantize_activations_int8_cuda(const __nv_bfloat16* X, int8_t* X_int8,
+                                     float* x_scale, float* x_rowsum,
+                                     int M, int K);
+// Post-process INT8 GEMM result: dequant correction + bias
+void int8_gemm_dequant_cuda(const int32_t* Y_i32, float* Y_out,
+                             const float* x_scale,
+                             const void* w_scale, DType w_scale_dtype,
+                             const int8_t* zp, const float* x_rowsum,
+                             const float* bias, int M, int N);
+
 // Fused INT8 dequant + BF16 WMMA GEMM declared here, defined in kernels.cu
 // Y[M,N] = X[M,K] @ W[N,K]^T + bias[N], dequantizing W from INT8 on-the-fly
 void fused_dequant_gemm_cuda(const __nv_bfloat16* X, const int8_t* W,
-                              const void* scales, DType scales_dtype, const float* bias,
+                              const void* scales, DType scales_dtype,
+                              const int8_t* zero_points,
+                              const float* bias,
                               float* Y, int M, int N, int K, int group_size);
 
 static inline Tensor to_f32_gpu(const Tensor& t) {
