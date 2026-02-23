@@ -240,6 +240,30 @@ void gelu_cuda(const float* x, float* out, int64_t n) {
     gelu_kernel<<<blocks, threads>>>(x, out, n);
 }
 
+// Fused GELU → BF16: applies GELU on F32 input, writes BF16 output.
+// Eliminates the separate f32_to_bf16 conversion before the next linear layer.
+__global__ void gelu_to_bf16_kernel(const float* x, __nv_bfloat16* out, int64_t n) {
+    int64_t i = ((int64_t)blockIdx.x * blockDim.x + threadIdx.x) * 4;
+    if (i + 3 < n) {
+        float4 v = *reinterpret_cast<const float4*>(x + i);
+        __nv_bfloat162 a = __floats2bfloat162_rn(gelu_val(v.x), gelu_val(v.y));
+        __nv_bfloat162 b = __floats2bfloat162_rn(gelu_val(v.z), gelu_val(v.w));
+        *reinterpret_cast<__nv_bfloat162*>(out + i) = a;
+        *reinterpret_cast<__nv_bfloat162*>(out + i + 2) = b;
+    } else {
+        for (int64_t j = i; j < n && j < i + 4; j++) {
+            out[j] = __float2bfloat16(gelu_val(x[j]));
+        }
+    }
+}
+
+void gelu_to_bf16_cuda(const float* x, __nv_bfloat16* out, int64_t n) {
+    int threads = 256;
+    int64_t work = (n + 3) / 4;
+    int blocks = (work + threads - 1) / threads;
+    gelu_to_bf16_kernel<<<blocks, threads>>>(x, out, n);
+}
+
 // ============================================================================
 // Exact GELU: 0.5 * x * (1 + erf(x / sqrt(2)))
 // Used by T5-XXL encoder (matches ggml_gelu)
@@ -416,6 +440,57 @@ void modulate_cuda(const float* x, const float* shift, const float* scale,
     while (t < threads) t *= 2;
     threads = t;
     modulate_kernel<<<M, threads, threads * sizeof(float)>>>(x, shift, scale, out, M, C, eps);
+}
+
+// Fused modulate → BF16: same computation but writes BF16 output.
+// Eliminates separate f32_to_bf16 conversion pass for per-group INT8 linear path.
+__global__ void modulate_to_bf16_kernel(const float* x, const float* shift, const float* scale,
+                                         __nv_bfloat16* out, int64_t M, int64_t C, float eps) {
+    int64_t row = blockIdx.x;
+    if (row >= M) return;
+    const float* xr = x + row * C;
+    __nv_bfloat16* or_ = out + row * C;
+
+    extern __shared__ float sdata[];
+
+    float sum = 0.0f;
+    for (int64_t i = threadIdx.x; i < C; i += blockDim.x) sum += xr[i];
+    sdata[threadIdx.x] = sum;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) sdata[threadIdx.x] += sdata[threadIdx.x + s];
+        __syncthreads();
+    }
+    float mean = sdata[0] / C;
+    __syncthreads();
+
+    float var_sum = 0.0f;
+    for (int64_t i = threadIdx.x; i < C; i += blockDim.x) {
+        float d = xr[i] - mean;
+        var_sum += d * d;
+    }
+    sdata[threadIdx.x] = var_sum;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) sdata[threadIdx.x] += sdata[threadIdx.x + s];
+        __syncthreads();
+    }
+    float inv_std = rsqrtf(sdata[0] / C + eps);
+    __syncthreads();
+
+    for (int64_t i = threadIdx.x; i < C; i += blockDim.x) {
+        float normed = (xr[i] - mean) * inv_std;
+        or_[i] = __float2bfloat16(normed * (1.0f + scale[i]) + shift[i]);
+    }
+}
+
+void modulate_to_bf16_cuda(const float* x, const float* shift, const float* scale,
+                            __nv_bfloat16* out, int64_t M, int64_t C, float eps) {
+    int threads = min((int64_t)256, C);
+    int t = 1;
+    while (t < threads) t *= 2;
+    threads = t;
+    modulate_to_bf16_kernel<<<M, threads, threads * sizeof(float)>>>(x, shift, scale, out, M, C, eps);
 }
 
 // ============================================================================
@@ -655,6 +730,31 @@ void concat_last_dim_cuda(const float* a, const float* b, float* out,
     int threads = 256;
     int blocks = (total + threads - 1) / threads;
     concat_last_dim_kernel<<<blocks, threads>>>(a, b, out, M, Da, Db);
+}
+
+// Fused concat → BF16: concatenates two F32 tensors and converts to BF16 in one pass.
+// Eliminates the separate concat + f32_to_bf16 for the single-block linear2 path.
+__global__ void concat_last_dim_to_bf16_kernel(const float* a, const float* b,
+                                                __nv_bfloat16* out,
+                                                int64_t M, int64_t Da, int64_t Db) {
+    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int64_t D_out = Da + Db;
+    if (idx >= M * D_out) return;
+    int64_t row = idx / D_out;
+    int64_t col = idx % D_out;
+    if (col < Da) {
+        out[idx] = __float2bfloat16(a[row * Da + col]);
+    } else {
+        out[idx] = __float2bfloat16(b[row * Db + (col - Da)]);
+    }
+}
+
+void concat_last_dim_to_bf16_cuda(const float* a, const float* b, __nv_bfloat16* out,
+                                   int64_t M, int64_t Da, int64_t Db) {
+    int64_t total = M * (Da + Db);
+    int threads = 256;
+    int blocks = (total + threads - 1) / threads;
+    concat_last_dim_to_bf16_kernel<<<blocks, threads>>>(a, b, out, M, Da, Db);
 }
 
 // Concat along first dim (seq dim): a: [Sa, D], b: [Sb, D] -> [Sa+Sb, D]
