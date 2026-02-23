@@ -446,11 +446,25 @@ void dequant_int8_to_bf16_cuda(const int8_t* src, const void* scales, DType scal
                                 __nv_bfloat16* dst, int64_t N, int64_t K,
                                 int group_size);
 
+// Vectorized INT8→BF16 dequant with zero_point support for pre-dequant + cuBLAS path
+// 16-wide vectorized loads, per-group scales, coalesced memory access
+void dequant_int8_to_bf16_vec_cuda(const int8_t* src, const void* scales, DType scales_dtype,
+                                    const int8_t* zero_points,
+                                    __nv_bfloat16* dst, int64_t N, int64_t K,
+                                    int group_size);
+
 // Dynamic INT8 activation quantization for INT8 GEMM path
 // smooth: optional [K] F32 SmoothQuant factors (activations divided by smooth before quantization)
+// need_rowsum: compute row sums for asymmetric weight dequant correction (skipped for symmetric)
+// Overloaded for BF16 and F32 inputs (F32 avoids the f32→bf16 conversion kernel)
 void quantize_activations_int8_cuda(const __nv_bfloat16* X, int8_t* X_int8,
                                      float* x_scale, float* x_rowsum,
-                                     int M, int K, const float* smooth);
+                                     int M, int K, const float* smooth,
+                                     bool need_rowsum);
+void quantize_activations_int8_cuda(const float* X, int8_t* X_int8,
+                                     float* x_scale, float* x_rowsum,
+                                     int M, int K, const float* smooth,
+                                     bool need_rowsum);
 // Post-process INT8 GEMM result: dequant correction + bias
 void int8_gemm_dequant_cuda(const int32_t* Y_i32, float* Y_out,
                              const float* x_scale,

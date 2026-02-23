@@ -14,6 +14,41 @@
 static cublasHandle_t g_cublas = nullptr;
 static cublasLtHandle_t g_cublaslt = nullptr;
 
+// cublasLt workspace: enables better algorithm selection (tiled algorithms)
+static void* g_cublas_workspace = nullptr;
+static size_t g_cublas_workspace_size = 32 * 1024 * 1024;  // 32MB
+
+// Scratch buffer for INT8→BF16 weight dequantization (reused across linear calls)
+static __nv_bfloat16* g_dequant_scratch = nullptr;
+static size_t g_dequant_scratch_elems = 0;
+
+// Algorithm cache: avoid repeated heuristic lookups for the same (M,N,K,types) combo
+struct LtAlgoKey {
+    int64_t M, K, N;
+    cudaDataType_t x_type, w_type;
+    bool has_bias;
+    bool operator==(const LtAlgoKey& o) const {
+        return M == o.M && K == o.K && N == o.N &&
+               x_type == o.x_type && w_type == o.w_type && has_bias == o.has_bias;
+    }
+};
+struct LtAlgoKeyHash {
+    size_t operator()(const LtAlgoKey& k) const {
+        size_t h = std::hash<int64_t>{}(k.M);
+        h ^= std::hash<int64_t>{}(k.K) * 2654435761ULL;
+        h ^= std::hash<int64_t>{}(k.N) * 40503ULL;
+        h ^= (size_t)k.x_type * 97;
+        h ^= (size_t)k.w_type * 31;
+        h ^= (size_t)k.has_bias;
+        return h;
+    }
+};
+struct LtAlgoCached {
+    cublasLtMatmulAlgo_t algo;
+    bool valid;
+};
+static std::unordered_map<LtAlgoKey, LtAlgoCached, LtAlgoKeyHash> g_algo_cache;
+
 struct CalibrationState {
     bool active = false;
     std::unordered_map<std::string, float*> act_absmax;  // weight_name → [K] GPU float accumulator
@@ -25,6 +60,18 @@ static void init_cublas() {
     if (!g_cublas) CHECK_CUBLAS(cublasCreate(&g_cublas));
     CHECK_CUBLAS(cublasSetMathMode(g_cublas, CUBLAS_DEFAULT_MATH));
     if (!g_cublaslt) CHECK_CUBLAS(cublasLtCreate(&g_cublaslt));
+    if (!g_cublas_workspace) {
+        CHECK_CUDA(cudaMalloc(&g_cublas_workspace, g_cublas_workspace_size));
+    }
+}
+
+// Ensure scratch buffer can hold at least `elems` BF16 elements
+static __nv_bfloat16* ensure_dequant_scratch(int64_t elems) {
+    if (elems <= (int64_t)g_dequant_scratch_elems) return g_dequant_scratch;
+    if (g_dequant_scratch) CHECK_CUDA(cudaFree(g_dequant_scratch));
+    CHECK_CUDA(cudaMalloc(&g_dequant_scratch, elems * sizeof(__nv_bfloat16)));
+    g_dequant_scratch_elems = (size_t)elems;
+    return g_dequant_scratch;
 }
 
 // cublasLt linear with fused bias epilogue
@@ -66,6 +113,30 @@ static void linear_lt(int64_t M, int64_t K, int64_t N,
     CHECK_CUBLAS(cublasLtMatrixLayoutCreate(&layout_b, x_type, K, M, K));
     CHECK_CUBLAS(cublasLtMatrixLayoutCreate(&layout_c, CUDA_R_32F, N, M, N));
 
+    // Cached heuristic algorithm selection: search once per unique (M,N,K,types) combo
+    LtAlgoKey algo_key = {M, K, N, x_type, w_type, bias_data != nullptr};
+    auto cache_it = g_algo_cache.find(algo_key);
+    if (cache_it == g_algo_cache.end()) {
+        cublasLtMatmulPreference_t pref;
+        CHECK_CUBLAS(cublasLtMatmulPreferenceCreate(&pref));
+        CHECK_CUBLAS(cublasLtMatmulPreferenceSetAttribute(pref,
+            CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
+            &g_cublas_workspace_size, sizeof(g_cublas_workspace_size)));
+
+        cublasLtMatmulHeuristicResult_t heuristic;
+        int n_results = 0;
+        cublasStatus_t heur_status = cublasLtMatmulAlgoGetHeuristic(g_cublaslt,
+            matmul_desc, layout_a, layout_b, layout_c, layout_c,
+            pref, 1, &heuristic, &n_results);
+
+        LtAlgoCached cached;
+        cached.valid = (heur_status == CUBLAS_STATUS_SUCCESS && n_results > 0);
+        if (cached.valid) cached.algo = heuristic.algo;
+        cache_it = g_algo_cache.emplace(algo_key, cached).first;
+
+        cublasLtMatmulPreferenceDestroy(pref);
+    }
+
     CHECK_CUBLAS(cublasLtMatmul(g_cublaslt,
         matmul_desc,
         &alpha,
@@ -74,9 +145,77 @@ static void linear_lt(int64_t M, int64_t K, int64_t N,
         &beta,
         out_data, layout_c,   // C = output
         out_data, layout_c,   // D = output (in-place)
-        nullptr,              // algo (nullptr = heuristic)
-        nullptr, 0,           // workspace
+        cache_it->second.valid ? &cache_it->second.algo : nullptr,
+        g_cublas_workspace, g_cublas_workspace_size,
         0));                  // stream
+    cublasLtMatrixLayoutDestroy(layout_a);
+    cublasLtMatrixLayoutDestroy(layout_b);
+    cublasLtMatrixLayoutDestroy(layout_c);
+    cublasLtMatmulDescDestroy(matmul_desc);
+}
+
+// INT8 x INT8 → INT32 GEMM via cublasLt with INT8 tensor cores
+// Y_int32[M,N] = X_int8[M,K] @ W_int8[N,K]^T
+// Uses 32MB workspace + heuristic algorithm selection + caching (same as BF16 path)
+static void linear_int8_gemm(int64_t M, int64_t K, int64_t N,
+                               const int8_t* x_int8, const int8_t* w_int8,
+                               int32_t* Y_int32) {
+    int32_t alpha = 1, beta = 0;
+
+    cublasLtMatmulDesc_t matmul_desc;
+    CHECK_CUBLAS(cublasLtMatmulDescCreate(&matmul_desc, CUBLAS_COMPUTE_32I, CUDA_R_32I));
+
+    // Row-major: C = X @ W^T
+    // Col-major perspective: C'[N,M] = W[N,K] @ X'[K,M]
+    cublasOperation_t transa = CUBLAS_OP_T;
+    cublasOperation_t transb = CUBLAS_OP_N;
+    CHECK_CUBLAS(cublasLtMatmulDescSetAttribute(matmul_desc, CUBLASLT_MATMUL_DESC_TRANSA, &transa, sizeof(transa)));
+    CHECK_CUBLAS(cublasLtMatmulDescSetAttribute(matmul_desc, CUBLASLT_MATMUL_DESC_TRANSB, &transb, sizeof(transb)));
+
+    // Matrix layouts (column-major perspective):
+    // A = W row-major [N,K] → col-major [K,N], ld=K (transposed to [N,K])
+    // B = X row-major [M,K] → col-major [K,M], ld=K
+    // C = Y row-major [M,N] → col-major [N,M], ld=N
+    cublasLtMatrixLayout_t layout_a, layout_b, layout_c;
+    CHECK_CUBLAS(cublasLtMatrixLayoutCreate(&layout_a, CUDA_R_8I, K, N, K));
+    CHECK_CUBLAS(cublasLtMatrixLayoutCreate(&layout_b, CUDA_R_8I, K, M, K));
+    CHECK_CUBLAS(cublasLtMatrixLayoutCreate(&layout_c, CUDA_R_32I, N, M, N));
+
+    // Cached heuristic algorithm selection
+    LtAlgoKey algo_key = {M, K, N, CUDA_R_8I, CUDA_R_8I, false};
+    auto cache_it = g_algo_cache.find(algo_key);
+    if (cache_it == g_algo_cache.end()) {
+        cublasLtMatmulPreference_t pref;
+        CHECK_CUBLAS(cublasLtMatmulPreferenceCreate(&pref));
+        CHECK_CUBLAS(cublasLtMatmulPreferenceSetAttribute(pref,
+            CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
+            &g_cublas_workspace_size, sizeof(g_cublas_workspace_size)));
+
+        cublasLtMatmulHeuristicResult_t heuristic;
+        int n_results = 0;
+        cublasStatus_t heur_status = cublasLtMatmulAlgoGetHeuristic(g_cublaslt,
+            matmul_desc, layout_a, layout_b, layout_c, layout_c,
+            pref, 1, &heuristic, &n_results);
+
+        LtAlgoCached cached;
+        cached.valid = (heur_status == CUBLAS_STATUS_SUCCESS && n_results > 0);
+        if (cached.valid) cached.algo = heuristic.algo;
+        cache_it = g_algo_cache.emplace(algo_key, cached).first;
+
+        cublasLtMatmulPreferenceDestroy(pref);
+    }
+
+    CHECK_CUBLAS(cublasLtMatmul(g_cublaslt,
+        matmul_desc,
+        &alpha,
+        w_int8, layout_a,     // A = W
+        x_int8, layout_b,     // B = X
+        &beta,
+        Y_int32, layout_c,    // C = output
+        Y_int32, layout_c,    // D = output (in-place)
+        cache_it->second.valid ? &cache_it->second.algo : nullptr,
+        g_cublas_workspace, g_cublas_workspace_size,
+        0));                   // stream
 
     cublasLtMatrixLayoutDestroy(layout_a);
     cublasLtMatrixLayoutDestroy(layout_b);
@@ -84,28 +223,11 @@ static void linear_lt(int64_t M, int64_t K, int64_t N,
     cublasLtMatmulDescDestroy(matmul_desc);
 }
 
-// INT8 x INT8 → INT32 GEMM via cublasGemmEx with INT8 tensor cores
-// Y_int32[M,N] = X_int8[M,K] @ W_int8[N,K]^T
-static void linear_int8_gemm(int64_t M, int64_t K, int64_t N,
-                               const int8_t* x_int8, const int8_t* w_int8,
-                               int32_t* Y_int32) {
-    int32_t alpha = 1, beta = 0;
-    CHECK_CUBLAS(cublasGemmEx(g_cublas,
-        CUBLAS_OP_T, CUBLAS_OP_N,
-        (int)N, (int)M, (int)K,
-        &alpha,
-        w_int8, CUDA_R_8I, (int)K,
-        x_int8, CUDA_R_8I, (int)K,
-        &beta,
-        Y_int32, CUDA_R_32I, (int)N,
-        CUBLAS_COMPUTE_32I, CUBLAS_GEMM_DEFAULT));
-}
-
 // Linear: output = x @ W^T + bias
 // x: [M, K], W: [N, K], bias: [N] or null, output: [M, N]
 // All stored row-major. Uses F32 accumulation.
 // Bias is fused into the GEMM epilogue via cublasLt (zero extra kernel launches).
-// INT8 weights: per-channel asymmetric uses INT8 GEMM, otherwise fused dequant + BF16 WMMA.
+// INT8 weights: per-channel uses INT8 GEMM (2x throughput), per-group uses dequant + cuBLAS BF16.
 static void linear(const Tensor& x, const Tensor& W, const Tensor* bias, Tensor& output) {
     assert(x.on_gpu && W.on_gpu && output.on_gpu);
     assert(x.ndim >= 1 && W.ndim == 2);
@@ -146,7 +268,49 @@ static void linear(const Tensor& x, const Tensor& W, const Tensor* bias, Tensor&
     if (W.dtype == DType::INT8) {
         assert(W.quant_scales && W.quant_group_size > 0 && "INT8 weight missing quant_scales or group_size");
 
-        // Convert activation to BF16
+        // Per-channel INT8 GEMM path (uses INT8 tensor cores, 2x BF16 throughput)
+        // Quantizes activations directly from native dtype (F32/BF16) — no intermediate conversion.
+        // Decomposition: Y = x_scale * w_scale * (X_i8 @ W_i8^T - zp * x_rowsum) + bias
+        // In-place: GEMM writes INT32 to output buffer, dequant overwrites with F32.
+        if (W.quant_group_size >= (int)K && K % 4 == 0) {
+            bool need_rowsum = (W.quant_zero_points != nullptr);
+            Tensor x_int8 = Tensor::alloc({M, K}, DType::INT8, true);
+            Tensor x_scale = Tensor::alloc({M}, DType::F32, true);
+            Tensor x_rowsum;
+            if (need_rowsum) x_rowsum = Tensor::alloc({M}, DType::F32, true);
+
+            // Quantize activations directly from native dtype (skip f32→bf16 conversion)
+            if (x.dtype == DType::F32) {
+                quantize_activations_int8_cuda(x.f32(), x_int8.i8(), x_scale.f32(),
+                                                need_rowsum ? x_rowsum.f32() : nullptr,
+                                                (int)M, (int)K, W.quant_smooth, need_rowsum);
+            } else if (x.dtype == DType::BF16) {
+                quantize_activations_int8_cuda(x.bf16(), x_int8.i8(), x_scale.f32(),
+                                                need_rowsum ? x_rowsum.f32() : nullptr,
+                                                (int)M, (int)K, W.quant_smooth, need_rowsum);
+            } else {
+                // FP16: convert to BF16 first (rare)
+                Tensor x_conv = Tensor::alloc_shape(x.ndim, x.shape, DType::BF16, true);
+                fp16_to_bf16_cuda(x.fp16(), x_conv.bf16(), x.numel());
+                quantize_activations_int8_cuda(x_conv.bf16(), x_int8.i8(), x_scale.f32(),
+                                                need_rowsum ? x_rowsum.f32() : nullptr,
+                                                (int)M, (int)K, W.quant_smooth, need_rowsum);
+            }
+
+            // INT8 GEMM → INT32, written directly to output buffer (both 4 bytes/elem)
+            linear_int8_gemm(M, K, N, x_int8.i8(), W.i8(), (int32_t*)output.data);
+
+            // In-place dequant: reads INT32 from output, writes F32 back to same buffer
+            int8_gemm_dequant_cuda((const int32_t*)output.data, output.f32(),
+                                    x_scale.f32(),
+                                    W.quant_scales, W.quant_scales_dtype,
+                                    (const int8_t*)W.quant_zero_points,
+                                    need_rowsum ? x_rowsum.f32() : nullptr,
+                                    (const float*)bias_data, (int)M, (int)N);
+            return;
+        }
+
+        // Convert activation to BF16 (needed for dequant+cuBLAS BF16 fallback path)
         const __nv_bfloat16* x_bf16;
         Tensor x_conv;
         if (x.dtype == DType::BF16) {
@@ -164,29 +328,6 @@ static void linear(const Tensor& x, const Tensor& W, const Tensor* bias, Tensor&
             exit(1);
         }
 
-        // Per-channel asymmetric: INT8 GEMM path (uses INT8 tensor cores, 2x BF16 throughput)
-        // Decomposition: Y = x_scale * w_scale * (X_i8 @ W_i8^T - zp * x_rowsum) + bias
-        // Requires K%4==0 for cuBLAS INT8 tensor cores; falls through to WMMA otherwise
-        if (W.quant_zero_points && W.quant_group_size >= (int)K && K % 4 == 0) {
-            Tensor x_int8 = Tensor::alloc({M, K}, DType::INT8, true);
-            Tensor x_scale = Tensor::alloc({M}, DType::F32, true);
-            Tensor x_rowsum = Tensor::alloc({M}, DType::F32, true);
-            quantize_activations_int8_cuda(x_bf16, x_int8.i8(), x_scale.f32(), x_rowsum.f32(),
-                                            (int)M, (int)K, W.quant_smooth);
-
-            // INT8 GEMM → INT32 accumulation buffer
-            Tensor y_i32 = Tensor::alloc({M, N}, DType::F32, true);  // 4 bytes/elem, same as INT32
-            linear_int8_gemm(M, K, N, x_int8.i8(), W.i8(), (int32_t*)y_i32.data);
-
-            // Dequant: Y_f32 = x_scale * w_scale * (Y_i32 - zp * x_rowsum) + bias
-            int8_gemm_dequant_cuda((const int32_t*)y_i32.data, output.f32(),
-                                    x_scale.f32(),
-                                    W.quant_scales, W.quant_scales_dtype,
-                                    (const int8_t*)W.quant_zero_points, x_rowsum.f32(),
-                                    (const float*)bias_data, (int)M, (int)N);
-            return;
-        }
-
         // SmoothQuant: divide activations by smooth factors before WMMA GEMM
         // Identity: X @ W^T = (X/s) @ (s*W)^T — s*W is baked into quantized weights
         Tensor x_smooth;
@@ -196,11 +337,15 @@ static void linear(const Tensor& x, const Tensor& W, const Tensor* bias, Tensor&
             x_bf16 = x_smooth.bf16();
         }
 
-        // Fused INT8 dequant + BF16 WMMA GEMM (per-group or symmetric per-channel)
-        fused_dequant_gemm_cuda(x_bf16, W.i8(), W.quant_scales, W.quant_scales_dtype,
-                                (const int8_t*)W.quant_zero_points,
-                                (const float*)bias_data, output.f32(),
-                                (int)M, (int)N, (int)K, W.quant_group_size);
+        // Pre-dequant INT8→BF16 into scratch buffer, then cuBLAS BF16 GEMM.
+        // The dequant kernel is bandwidth-bound (coalesced reads), and cuBLAS BF16
+        // uses cp.async for both operands — beating the fused WMMA kernel which is
+        // memory-latency bound on strided W loads (long_scoreboard stalls).
+        __nv_bfloat16* w_bf16 = ensure_dequant_scratch(N * K);
+        dequant_int8_to_bf16_vec_cuda(W.i8(), W.quant_scales, W.quant_scales_dtype,
+                                       (const int8_t*)W.quant_zero_points,
+                                       w_bf16, N, K, W.quant_group_size);
+        linear_lt(M, K, N, x_bf16, CUDA_R_16BF, w_bf16, CUDA_R_16BF, bias_data, output.data);
         return;
     }
 

@@ -1327,23 +1327,114 @@ void dequant_int8_to_bf16_cuda(const int8_t* src, const void* scales, DType scal
 }
 
 // ============================================================================
+// Vectorized INT8→BF16 dequant for pre-dequant + cuBLAS path
+// Each thread processes 16 INT8 elements via uint4 load, writes 16 BF16.
+// Handles per-group scales and optional zero_points.
+// ============================================================================
+
+__global__ void dequant_int8_to_bf16_vec_kernel(
+    const int8_t* __restrict__ w,
+    const void* __restrict__ scales,
+    int scales_dtype,
+    const int8_t* __restrict__ zero_points,
+    __nv_bfloat16* __restrict__ out,
+    int64_t N, int64_t K,
+    int num_groups, int group_size)
+{
+    int64_t tid = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    int64_t elem_start = tid * 16;
+    int64_t total = N * K;
+
+    if (elem_start >= total) return;
+
+    // Scalar tail: last partial chunk OR chunk that would cross a row boundary
+    if (elem_start + 16 > total || (elem_start % K) + 16 > K) {
+        for (int i = 0; i < 16 && elem_start + i < total; i++) {
+            int64_t idx = elem_start + i;
+            int64_t n = idx / K;
+            int64_t k = idx % K;
+            int g = (int)(k / group_size);
+            int64_t gi = n * num_groups + g;
+            float s = load_quant_scale_device(scales, scales_dtype, gi);
+            float z = zero_points ? (float)zero_points[gi] : 0.0f;
+            out[idx] = __float2bfloat16(((float)w[idx] - z) * s);
+        }
+        return;
+    }
+
+    int64_t n = elem_start / K;
+    int64_t k = elem_start % K;
+
+    // Vectorized read: 16 INT8 values (uint4 = 16 bytes, coalesced)
+    uint4 raw = *reinterpret_cast<const uint4*>(w + elem_start);
+    const int8_t* q = reinterpret_cast<const int8_t*>(&raw);
+
+    // Load scale and zero_point for the starting group
+    int g_start = (int)(k / group_size);
+    int g_end = (int)((k + 15) / group_size);
+    int64_t gi = n * num_groups + g_start;
+    float s = load_quant_scale_device(scales, scales_dtype, gi);
+    float z = zero_points ? (float)zero_points[gi] : 0.0f;
+
+    if (g_start == g_end) {
+        // Fast path: all 16 elements in the same group (common for group_size >= 16)
+        #pragma unroll
+        for (int i = 0; i < 16; i += 2) {
+            *reinterpret_cast<__nv_bfloat162*>(out + elem_start + i) =
+                __floats2bfloat162_rn(((float)q[i] - z) * s, ((float)q[i+1] - z) * s);
+        }
+    } else {
+        // Slow path: group boundary within this 16-element chunk
+        int64_t scale_base = n * num_groups;
+        #pragma unroll
+        for (int i = 0; i < 16; i += 2) {
+            int gi0 = (int)((k + i) / group_size);
+            int gi1 = (int)((k + i + 1) / group_size);
+            float s0 = load_quant_scale_device(scales, scales_dtype, scale_base + gi0);
+            float s1 = load_quant_scale_device(scales, scales_dtype, scale_base + gi1);
+            float z0 = zero_points ? (float)zero_points[scale_base + gi0] : 0.0f;
+            float z1 = zero_points ? (float)zero_points[scale_base + gi1] : 0.0f;
+            *reinterpret_cast<__nv_bfloat162*>(out + elem_start + i) =
+                __floats2bfloat162_rn(((float)q[i] - z0) * s0, ((float)q[i+1] - z1) * s1);
+        }
+    }
+}
+
+void dequant_int8_to_bf16_vec_cuda(const int8_t* src, const void* scales, DType scales_dtype,
+                                    const int8_t* zero_points,
+                                    __nv_bfloat16* dst, int64_t N, int64_t K,
+                                    int group_size) {
+    int num_groups = (int)((K + group_size - 1) / group_size);
+    int64_t total_elems = N * K;
+    int64_t work_items = (total_elems + 15) / 16;
+    int threads = 256;
+    int blocks = (int)((work_items + threads - 1) / threads);
+    dequant_int8_to_bf16_vec_kernel<<<blocks, threads>>>(
+        src, scales, (int)scales_dtype, zero_points, dst, N, K, num_groups, group_size);
+}
+
+// ============================================================================
 // Dynamic INT8 activation quantization for INT8 GEMM path
 // Per-row symmetric: x_int8 = round(x * 127/absmax), x_scale = absmax/127
 // Also computes row sums of x_int8 for asymmetric weight dequant correction:
 //   Y[m,n] = x_scale[m] * w_scale[n] * (GEMM[m,n] - zp[n] * x_rowsum[m])
 // ============================================================================
 
+// Template on NEED_ROWSUM and InputT (float or __nv_bfloat16):
+// - NEED_ROWSUM=false skips integer rowsum accumulation + reduction (symmetric quantization)
+// - InputT=float avoids the f32→bf16 conversion kernel when activations are already F32
+template<bool NEED_ROWSUM, typename InputT>
 __global__ void quantize_activations_kernel(
-    const __nv_bfloat16* __restrict__ X,   // [M, K]
+    const InputT* __restrict__ X,          // [M, K]
     int8_t* __restrict__ X_int8,           // [M, K]
     float* __restrict__ x_scale,           // [M]
-    float* __restrict__ x_rowsum,          // [M] (float-cast of int sum)
+    float* __restrict__ x_rowsum,          // [M] or nullptr (only written when NEED_ROWSUM)
     const float* __restrict__ smooth,      // [K] or nullptr
     int M, int K)
 {
     int row = blockIdx.x;
     if (row >= M) return;
-    const __nv_bfloat16* x_row = X + (int64_t)row * K;
+    const InputT* x_row = X + (int64_t)row * K;
     int8_t* out_row = X_int8 + (int64_t)row * K;
 
     extern __shared__ char qsmem[];
@@ -1352,7 +1443,11 @@ __global__ void quantize_activations_kernel(
     // Pass 1: find per-row absmax (on smoothed values if smooth != nullptr)
     float local_max = 0.0f;
     for (int k = threadIdx.x; k < K; k += blockDim.x) {
-        float v = __bfloat162float(x_row[k]);
+        float v;
+        if constexpr (__is_same(InputT, __nv_bfloat16))
+            v = __bfloat162float(x_row[k]);
+        else
+            v = x_row[k];
         if (smooth) v /= smooth[k];
         local_max = fmaxf(local_max, fabsf(v));
     }
@@ -1368,33 +1463,62 @@ __global__ void quantize_activations_kernel(
     if (threadIdx.x == 0) x_scale[row] = absmax / 127.0f;
     __syncthreads();
 
-    // Pass 2: quantize to INT8 and accumulate row sum (on smoothed values)
+    // Pass 2: quantize to INT8 (and accumulate row sum if needed for asymmetric dequant)
     int local_sum = 0;
     for (int k = threadIdx.x; k < K; k += blockDim.x) {
-        float v = __bfloat162float(x_row[k]);
+        float v;
+        if constexpr (__is_same(InputT, __nv_bfloat16))
+            v = __bfloat162float(x_row[k]);
+        else
+            v = x_row[k];
         if (smooth) v /= smooth[k];
         int q = __float2int_rn(v * inv_scale);
         q = max(-128, min(127, q));
         out_row[k] = (int8_t)q;
-        local_sum += q;
+        if constexpr (NEED_ROWSUM) local_sum += q;
     }
-    int* idata = reinterpret_cast<int*>(qsmem);
-    idata[threadIdx.x] = local_sum;
-    __syncthreads();
-    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (threadIdx.x < (unsigned)s)
-            idata[threadIdx.x] += idata[threadIdx.x + s];
+
+    if constexpr (NEED_ROWSUM) {
+        int* idata = reinterpret_cast<int*>(qsmem);
+        idata[threadIdx.x] = local_sum;
         __syncthreads();
+        for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+            if (threadIdx.x < (unsigned)s)
+                idata[threadIdx.x] += idata[threadIdx.x + s];
+            __syncthreads();
+        }
+        if (threadIdx.x == 0) x_rowsum[row] = (float)idata[0];
     }
-    if (threadIdx.x == 0) x_rowsum[row] = (float)idata[0];
+}
+
+// Launcher helper (dispatches NEED_ROWSUM × InputT template)
+template<typename InputT>
+static void quantize_activations_dispatch(const InputT* X, int8_t* X_int8,
+                                           float* x_scale, float* x_rowsum,
+                                           int M, int K, const float* smooth,
+                                           bool need_rowsum) {
+    int threads = 256;
+    if (need_rowsum) {
+        quantize_activations_kernel<true, InputT><<<M, threads, threads * sizeof(float)>>>(
+            X, X_int8, x_scale, x_rowsum, smooth, M, K);
+    } else {
+        quantize_activations_kernel<false, InputT><<<M, threads, threads * sizeof(float)>>>(
+            X, X_int8, x_scale, x_rowsum, smooth, M, K);
+    }
 }
 
 void quantize_activations_int8_cuda(const __nv_bfloat16* X, int8_t* X_int8,
                                      float* x_scale, float* x_rowsum,
-                                     int M, int K, const float* smooth) {
-    int threads = 256;
-    quantize_activations_kernel<<<M, threads, threads * sizeof(float)>>>(
-        X, X_int8, x_scale, x_rowsum, smooth, M, K);
+                                     int M, int K, const float* smooth,
+                                     bool need_rowsum) {
+    quantize_activations_dispatch(X, X_int8, x_scale, x_rowsum, M, K, smooth, need_rowsum);
+}
+
+void quantize_activations_int8_cuda(const float* X, int8_t* X_int8,
+                                     float* x_scale, float* x_rowsum,
+                                     int M, int K, const float* smooth,
+                                     bool need_rowsum) {
+    quantize_activations_dispatch(X, X_int8, x_scale, x_rowsum, M, K, smooth, need_rowsum);
 }
 
 // ============================================================================
@@ -1402,29 +1526,78 @@ void quantize_activations_int8_cuda(const __nv_bfloat16* X, int8_t* X_int8,
 // Y[m,n] = x_scale[m] * w_scale[n] * (Y[m,n] - zp[n] * x_rowsum[m]) + bias[n]
 // ============================================================================
 
+// Vectorized: processes 4 elements per thread via int4 load / float4 store (16B coalesced)
+// Template on HAS_ZP to avoid branching on zp/x_rowsum in the hot loop
+template<bool HAS_ZP>
 __global__ void int8_gemm_dequant_kernel(
     const int32_t* __restrict__ Y_i32,        // [M, N] INT32 from GEMM
     float* __restrict__ Y_out,                // [M, N] F32 output
     const float* __restrict__ x_scale,        // [M]
     const void* __restrict__ w_scale,         // [N] F32/FP16/BF16
     int w_scale_dtype,
-    const int8_t* __restrict__ zp,            // [N] or nullptr
-    const float* __restrict__ x_rowsum,       // [M]
+    const int8_t* __restrict__ zp,            // [N] or nullptr (only read when HAS_ZP)
+    const float* __restrict__ x_rowsum,       // [M] or nullptr (only read when HAS_ZP)
     const float* __restrict__ bias,           // [N] or nullptr
     int M, int N)
 {
-    int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= (int64_t)M * N) return;
-    int m = (int)(idx / N);
-    int n = (int)(idx % N);
+    int64_t total = (int64_t)M * N;
+    int64_t vid = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    int64_t base = vid * 4;
+    if (base >= total) return;
 
-    float raw = (float)Y_i32[idx];
-    float xs = x_scale[m];
-    float ws = load_quant_scale_device(w_scale, w_scale_dtype, (int64_t)n);
-    float correction = zp ? (float)zp[n] * x_rowsum[m] : 0.0f;
-    float val = xs * ws * (raw - correction);
-    if (bias) val += bias[n];
-    Y_out[idx] = val;
+    int m = (int)(base / N);
+    int n = (int)(base % N);
+
+    // Vectorized path: all 4 elements in the same row and within bounds
+    if (n + 3 < N && base + 3 < total) {
+        // Coalesced int4 load (4 x INT32 = 16 bytes)
+        int4 raw4 = *reinterpret_cast<const int4*>(Y_i32 + base);
+        float xs = x_scale[m];
+
+        // Load 4 consecutive w_scale values
+        float ws0 = load_quant_scale_device(w_scale, w_scale_dtype, (int64_t)n);
+        float ws1 = load_quant_scale_device(w_scale, w_scale_dtype, (int64_t)(n + 1));
+        float ws2 = load_quant_scale_device(w_scale, w_scale_dtype, (int64_t)(n + 2));
+        float ws3 = load_quant_scale_device(w_scale, w_scale_dtype, (int64_t)(n + 3));
+
+        float4 out;
+        if constexpr (HAS_ZP) {
+            float rowsum = x_rowsum[m];
+            out.x = xs * ws0 * ((float)raw4.x - (float)zp[n]     * rowsum);
+            out.y = xs * ws1 * ((float)raw4.y - (float)zp[n + 1] * rowsum);
+            out.z = xs * ws2 * ((float)raw4.z - (float)zp[n + 2] * rowsum);
+            out.w = xs * ws3 * ((float)raw4.w - (float)zp[n + 3] * rowsum);
+        } else {
+            out.x = xs * ws0 * (float)raw4.x;
+            out.y = xs * ws1 * (float)raw4.y;
+            out.z = xs * ws2 * (float)raw4.z;
+            out.w = xs * ws3 * (float)raw4.w;
+        }
+
+        if (bias) {
+            out.x += bias[n];
+            out.y += bias[n + 1];
+            out.z += bias[n + 2];
+            out.w += bias[n + 3];
+        }
+
+        *reinterpret_cast<float4*>(Y_out + base) = out;
+    } else {
+        // Scalar fallback: row boundary or tail elements
+        for (int i = 0; i < 4; i++) {
+            int64_t idx = base + i;
+            if (idx >= total) break;
+            int mi = (int)(idx / N);
+            int ni = (int)(idx % N);
+            float raw = (float)Y_i32[idx];
+            float xs = x_scale[mi];
+            float ws = load_quant_scale_device(w_scale, w_scale_dtype, (int64_t)ni);
+            float correction = HAS_ZP ? (float)zp[ni] * x_rowsum[mi] : 0.0f;
+            float val = xs * ws * (raw - correction);
+            if (bias) val += bias[ni];
+            Y_out[idx] = val;
+        }
+    }
 }
 
 void int8_gemm_dequant_cuda(const int32_t* Y_i32, float* Y_out,
@@ -1434,9 +1607,16 @@ void int8_gemm_dequant_cuda(const int32_t* Y_i32, float* Y_out,
                              const float* bias, int M, int N) {
     int threads = 256;
     int64_t total = (int64_t)M * N;
-    int blocks = (int)((total + threads - 1) / threads);
-    int8_gemm_dequant_kernel<<<blocks, threads>>>(
-        Y_i32, Y_out, x_scale, w_scale, (int)w_scale_dtype, zp, x_rowsum, bias, M, N);
+    // Each thread handles 4 elements (vectorized or scalar fallback)
+    int64_t n_threads = (total + 3) / 4;
+    int blocks = (int)((n_threads + threads - 1) / threads);
+    if (zp) {
+        int8_gemm_dequant_kernel<true><<<blocks, threads>>>(
+            Y_i32, Y_out, x_scale, w_scale, (int)w_scale_dtype, zp, x_rowsum, bias, M, N);
+    } else {
+        int8_gemm_dequant_kernel<false><<<blocks, threads>>>(
+            Y_i32, Y_out, x_scale, w_scale, (int)w_scale_dtype, zp, x_rowsum, bias, M, N);
+    }
 }
 
 // ============================================================================
