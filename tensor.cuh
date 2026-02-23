@@ -139,6 +139,8 @@ struct Tensor {
     DType quant_scales_dtype = DType::F32;
     int quant_group_size = 0;       // 0 = not quantized, >0 = per-group scale granularity
     void* quant_zero_points = nullptr;  // [N] or [N, num_groups] INT8, nullptr = symmetric
+    float* quant_smooth = nullptr;      // [K] F32 SmoothQuant factors, nullptr = no smoothing
+    const char* calib_name = nullptr;   // weight name for calibration (strdup'd, never freed)
     int64_t shape[4] = {0, 0, 0, 0};
     int64_t stride[4] = {0, 0, 0, 0};  // in elements
     int ndim = 0;
@@ -155,6 +157,7 @@ struct Tensor {
         o.quant_scales = nullptr;
         o.quant_scales_dtype = DType::F32;
         o.quant_zero_points = nullptr;
+        o.quant_smooth = nullptr;
         o.owns_data = false;
     }
     Tensor& operator=(Tensor&& o) noexcept {
@@ -165,6 +168,7 @@ struct Tensor {
             o.quant_scales = nullptr;
             o.quant_scales_dtype = DType::F32;
             o.quant_zero_points = nullptr;
+            o.quant_smooth = nullptr;
             o.owns_data = false;
         }
         return *this;
@@ -188,6 +192,7 @@ struct Tensor {
         quant_scales = nullptr;
         quant_scales_dtype = DType::F32;
         quant_zero_points = nullptr;
+        quant_smooth = nullptr;
         owns_data = false;
     }
 
@@ -355,6 +360,8 @@ struct Tensor {
         t.quant_scales_dtype = quant_scales_dtype;
         t.quant_group_size = quant_group_size;
         t.quant_zero_points = quant_zero_points;
+        t.quant_smooth = quant_smooth;
+        t.calib_name = calib_name;
         t.ndim = (int)new_shape.size();
         t.dtype = dtype;
         t.on_gpu = on_gpu;
@@ -394,6 +401,8 @@ struct Tensor {
         } else {
             t.quant_zero_points = nullptr;
         }
+        t.quant_smooth = quant_smooth;  // [K] per-input-channel, same for all row slices
+        t.calib_name = calib_name;
         t.ndim = ndim;
         for (int i = 0; i < ndim; i++) {
             t.shape[i] = (i == 0) ? count : shape[i];
@@ -438,9 +447,10 @@ void dequant_int8_to_bf16_cuda(const int8_t* src, const void* scales, DType scal
                                 int group_size);
 
 // Dynamic INT8 activation quantization for INT8 GEMM path
+// smooth: optional [K] F32 SmoothQuant factors (activations divided by smooth before quantization)
 void quantize_activations_int8_cuda(const __nv_bfloat16* X, int8_t* X_int8,
                                      float* x_scale, float* x_rowsum,
-                                     int M, int K);
+                                     int M, int K, const float* smooth);
 // Post-process INT8 GEMM result: dequant correction + bias
 void int8_gemm_dequant_cuda(const int32_t* Y_i32, float* Y_out,
                              const float* x_scale,
@@ -455,6 +465,13 @@ void fused_dequant_gemm_cuda(const __nv_bfloat16* X, const int8_t* W,
                               const int8_t* zero_points,
                               const float* bias,
                               float* Y, int M, int N, int K, int group_size);
+
+// SmoothQuant: divide BF16 [M,K] activations by float [K] smooth factors
+void smooth_div_bf16_cuda(const __nv_bfloat16* X, const float* smooth,
+                           __nv_bfloat16* out, int M, int K);
+
+// Calibration: accumulate per-column absmax of BF16 activation matrix
+void calibrate_act_absmax_cuda(const __nv_bfloat16* X, float* accum, int M, int K);
 
 static inline Tensor to_f32_gpu(const Tensor& t) {
     if (t.dtype == DType::F32) return t.to_gpu();

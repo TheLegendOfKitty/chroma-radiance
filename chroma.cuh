@@ -66,6 +66,7 @@ static Tensor linear_forward(const Tensor& x, const Tensor& W, const Tensor* bia
 // ============================================================================
 static Tensor load_weight(const SafetensorsFile& sf, const std::string& name) {
     Tensor w = sf.load_tensor_native(name);
+    w.calib_name = strdup(name.c_str());
     if (w.dtype == DType::INT8 && w.ndim == 2) {
         // Load companion scale tensor
         std::string scale_name = name + ".scale";
@@ -89,6 +90,14 @@ static Tensor load_weight(const SafetensorsFile& sf, const std::string& name) {
             assert(zp_t.dtype == DType::INT8);
             w.quant_zero_points = zp_t.data;
             zp_t.owns_data = false;  // arena owns memory
+        }
+        // Load companion smooth tensor (SmoothQuant channel factors)
+        std::string smooth_name = name + ".smooth";
+        if (sf.has_tensor(smooth_name)) {
+            Tensor smooth_t = sf.load_tensor_native(smooth_name);
+            assert(smooth_t.dtype == DType::F32 && smooth_t.ndim == 1);
+            w.quant_smooth = (float*)smooth_t.data;
+            smooth_t.owns_data = false;  // arena owns memory
         }
     }
     return w;
@@ -527,10 +536,14 @@ struct ChromaRadiance {
                 if (parent.quant_zero_points) {
                     t.quant_zero_points = (char*)parent.quant_zero_points + row_off * num_groups;
                 }
+                t.quant_smooth = parent.quant_smooth;
+                t.calib_name = parent.calib_name;
                 return t;
             }
-            return Tensor::wrap_gpu(
+            auto t = Tensor::wrap_gpu(
                 (char*)parent.data + row_bytes * row_off, {nrows, ncols}, parent.dtype);
+            t.calib_name = parent.calib_name;
+            return t;
         };
 
         // === Image attention ===
@@ -663,10 +676,14 @@ struct ChromaRadiance {
                 if (parent.quant_zero_points) {
                     t.quant_zero_points = (char*)parent.quant_zero_points + row_off * num_groups;
                 }
+                t.quant_smooth = parent.quant_smooth;
+                t.calib_name = parent.calib_name;
                 return t;
             }
-            return Tensor::wrap_gpu(
+            auto t = Tensor::wrap_gpu(
                 (char*)parent.data + row_bytes * row_off, {nrows, ncols}, parent.dtype);
+            t.calib_name = parent.calib_name;
+            return t;
         };
 
         Tensor sq_w = wrap_wv(w.linear1_w, 0, hidden_size, hidden_size);

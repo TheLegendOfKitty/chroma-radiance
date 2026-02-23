@@ -79,6 +79,7 @@ struct Args {
     int rng_mode = 1;  // 0 = pytorch, 1 = sd.cpp (default to sd.cpp for comparison)
     bool no_mask = false;
     bool debug = false;
+    std::string calibrate_path = "";  // --calibrate: output file for activation stats
 };
 
 static Args parse_args(int argc, char** argv) {
@@ -115,6 +116,8 @@ static Args parse_args(int argc, char** argv) {
             args.no_mask = true;
         } else if (strcmp(argv[i], "--debug") == 0) {
             args.debug = true;
+        } else if (strcmp(argv[i], "--calibrate") == 0) {
+            args.calibrate_path = argv[++i];
         } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
             printf("Usage: chroma-radiance [options]\n");
             printf("  -p, --prompt TEXT     Prompt text (default: 'a photo of a cat')\n");
@@ -129,6 +132,7 @@ static Args parse_args(int argc, char** argv) {
             printf("  --t5 PATH             T5 model path (default: auto-detect)\n");
             printf("  --tokenizer PATH      T5 tokenizer JSON path (default: auto-detect)\n");
             printf("  --rng MODE            RNG mode: pytorch or sdcpp (default: sdcpp)\n");
+            printf("  --calibrate PATH      Collect activation stats and save to safetensors file\n");
             exit(0);
         }
     }
@@ -145,6 +149,58 @@ static Args parse_args(int argc, char** argv) {
     }
 
     return args;
+}
+
+static void save_calibration(const std::string& path) {
+    // Copy all accumulator buffers from GPU to CPU
+    struct Entry { std::string name; int K; std::vector<float> data; };
+    std::vector<Entry> entries;
+    for (auto& [name, gpu_buf] : g_calib.act_absmax) {
+        int K = g_calib.k_dims[name];
+        Entry e;
+        e.name = name;
+        e.K = K;
+        e.data.resize(K);
+        CHECK_CUDA(cudaMemcpy(e.data.data(), gpu_buf, K * sizeof(float), cudaMemcpyDeviceToHost));
+        cudaFree(gpu_buf);
+        entries.push_back(std::move(e));
+    }
+    g_calib.act_absmax.clear();
+    g_calib.k_dims.clear();
+
+    // Sort by name for deterministic output
+    std::sort(entries.begin(), entries.end(),
+              [](const Entry& a, const Entry& b) { return a.name < b.name; });
+
+    // Build JSON header and compute data offsets
+    std::string json = "{";
+    size_t data_offset = 0;
+    for (size_t i = 0; i < entries.size(); i++) {
+        if (i > 0) json += ",";
+        size_t nbytes = entries[i].K * sizeof(float);
+        json += "\"" + entries[i].name + "\":{\"dtype\":\"F32\",\"shape\":[" +
+                std::to_string(entries[i].K) + "],\"data_offsets\":[" +
+                std::to_string(data_offset) + "," + std::to_string(data_offset + nbytes) + "]}";
+        data_offset += nbytes;
+    }
+    json += "}";
+
+    // Write file: 8-byte header size + JSON + tensor data
+    FILE* f = fopen(path.c_str(), "wb");
+    if (!f) {
+        fprintf(stderr, "Failed to open %s for writing\n", path.c_str());
+        return;
+    }
+    uint64_t hdr_size = json.size();
+    fwrite(&hdr_size, sizeof(uint64_t), 1, f);
+    fwrite(json.data(), 1, json.size(), f);
+    for (auto& e : entries) {
+        fwrite(e.data.data(), sizeof(float), e.K, f);
+    }
+    fclose(f);
+
+    printf("Saved calibration: %zu tensors, %.1f KB\n",
+           entries.size(), (8 + json.size() + data_offset) / 1024.0);
 }
 
 int main(int argc, char** argv) {
@@ -285,6 +341,12 @@ int main(int argc, char** argv) {
         cudaMemGetInfo(&free_mem, &total_mem);
         printf("T5 weights freed. GPU memory: %.1f GB free / %.1f GB total\n",
                free_mem / 1e9, total_mem / 1e9);
+    }
+
+    // Enable calibration mode if requested
+    if (!args.calibrate_path.empty()) {
+        g_calib.active = true;
+        printf("\nCalibration mode: collecting activation statistics\n");
     }
 
     // ========================================
@@ -446,6 +508,13 @@ int main(int argc, char** argv) {
     printf("Sampling done in %.1f ms (%.1f ms/step)\n",
            std::chrono::duration<float, std::milli>(t4 - t3).count(),
            std::chrono::duration<float, std::milli>(t4 - t3).count() / args.steps);
+
+    // Save calibration data if in calibration mode
+    if (g_calib.active) {
+        save_calibration(args.calibrate_path);
+        printf("Calibration data saved to %s\n", args.calibrate_path.c_str());
+        g_calib.active = false;
+    }
 
     // ========================================
     // Phase 5: Save output

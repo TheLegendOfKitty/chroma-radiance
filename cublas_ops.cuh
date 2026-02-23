@@ -14,6 +14,13 @@
 static cublasHandle_t g_cublas = nullptr;
 static cublasLtHandle_t g_cublaslt = nullptr;
 
+struct CalibrationState {
+    bool active = false;
+    std::unordered_map<std::string, float*> act_absmax;  // weight_name → [K] GPU float accumulator
+    std::unordered_map<std::string, int> k_dims;
+};
+static CalibrationState g_calib;
+
 static void init_cublas() {
     if (!g_cublas) CHECK_CUBLAS(cublasCreate(&g_cublas));
     CHECK_CUBLAS(cublasSetMathMode(g_cublas, CUBLAS_DEFAULT_MATH));
@@ -103,13 +110,37 @@ static void linear(const Tensor& x, const Tensor& W, const Tensor* bias, Tensor&
     assert(x.on_gpu && W.on_gpu && output.on_gpu);
     assert(x.ndim >= 1 && W.ndim == 2);
 
-    int64_t M = x.numel() / x.shape[x.ndim - 1]; // batch*seq
+    int64_t M = x.numel() / x.shape[x.ndim - 1];
     int64_t K = x.shape[x.ndim - 1];
     int64_t N = W.shape[0];
     assert(W.shape[1] == K);
     assert(output.numel() == M * N);
 
     const void* bias_data = (bias && bias->on_gpu && bias->dtype == DType::F32) ? bias->data : nullptr;
+
+    // Calibration: record per-K-channel activation absmax
+    if (g_calib.active && W.calib_name) {
+        std::string name(W.calib_name);
+        if (g_calib.act_absmax.find(name) == g_calib.act_absmax.end()) {
+            float* buf;
+            CHECK_CUDA(cudaMalloc(&buf, K * sizeof(float)));
+            CHECK_CUDA(cudaMemset(buf, 0, K * sizeof(float)));
+            g_calib.act_absmax[name] = buf;
+            g_calib.k_dims[name] = (int)K;
+        }
+        const __nv_bfloat16* x_bf16_cal = nullptr;
+        Tensor x_conv_cal;
+        if (x.dtype == DType::BF16) {
+            x_bf16_cal = x.bf16();
+        } else if (x.dtype == DType::F32) {
+            x_conv_cal = Tensor::alloc_shape(x.ndim, x.shape, DType::BF16, true);
+            f32_to_bf16_cuda(x.f32(), x_conv_cal.bf16(), x.numel());
+            x_bf16_cal = x_conv_cal.bf16();
+        }
+        if (x_bf16_cal) {
+            calibrate_act_absmax_cuda(x_bf16_cal, g_calib.act_absmax[name], (int)M, (int)K);
+        }
+    }
 
     // INT8 weight path
     if (W.dtype == DType::INT8) {
@@ -141,7 +172,7 @@ static void linear(const Tensor& x, const Tensor& W, const Tensor* bias, Tensor&
             Tensor x_scale = Tensor::alloc({M}, DType::F32, true);
             Tensor x_rowsum = Tensor::alloc({M}, DType::F32, true);
             quantize_activations_int8_cuda(x_bf16, x_int8.i8(), x_scale.f32(), x_rowsum.f32(),
-                                            (int)M, (int)K);
+                                            (int)M, (int)K, W.quant_smooth);
 
             // INT8 GEMM → INT32 accumulation buffer
             Tensor y_i32 = Tensor::alloc({M, N}, DType::F32, true);  // 4 bytes/elem, same as INT32
@@ -154,6 +185,15 @@ static void linear(const Tensor& x, const Tensor& W, const Tensor* bias, Tensor&
                                     (const int8_t*)W.quant_zero_points, x_rowsum.f32(),
                                     (const float*)bias_data, (int)M, (int)N);
             return;
+        }
+
+        // SmoothQuant: divide activations by smooth factors before WMMA GEMM
+        // Identity: X @ W^T = (X/s) @ (s*W)^T — s*W is baked into quantized weights
+        Tensor x_smooth;
+        if (W.quant_smooth) {
+            x_smooth = Tensor::alloc({M, K}, DType::BF16, true);
+            smooth_div_bf16_cuda(x_bf16, W.quant_smooth, x_smooth.bf16(), (int)M, (int)K);
+            x_bf16 = x_smooth.bf16();
         }
 
         // Fused INT8 dequant + BF16 WMMA GEMM (per-group or symmetric per-channel)

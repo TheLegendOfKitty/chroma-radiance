@@ -1338,6 +1338,7 @@ __global__ void quantize_activations_kernel(
     int8_t* __restrict__ X_int8,           // [M, K]
     float* __restrict__ x_scale,           // [M]
     float* __restrict__ x_rowsum,          // [M] (float-cast of int sum)
+    const float* __restrict__ smooth,      // [K] or nullptr
     int M, int K)
 {
     int row = blockIdx.x;
@@ -1348,11 +1349,12 @@ __global__ void quantize_activations_kernel(
     extern __shared__ char qsmem[];
     float* fdata = reinterpret_cast<float*>(qsmem);
 
-    // Pass 1: find per-row absmax
+    // Pass 1: find per-row absmax (on smoothed values if smooth != nullptr)
     float local_max = 0.0f;
     for (int k = threadIdx.x; k < K; k += blockDim.x) {
-        float v = fabsf(__bfloat162float(x_row[k]));
-        local_max = fmaxf(local_max, v);
+        float v = __bfloat162float(x_row[k]);
+        if (smooth) v /= smooth[k];
+        local_max = fmaxf(local_max, fabsf(v));
     }
     fdata[threadIdx.x] = local_max;
     __syncthreads();
@@ -1366,10 +1368,11 @@ __global__ void quantize_activations_kernel(
     if (threadIdx.x == 0) x_scale[row] = absmax / 127.0f;
     __syncthreads();
 
-    // Pass 2: quantize to INT8 and accumulate row sum
+    // Pass 2: quantize to INT8 and accumulate row sum (on smoothed values)
     int local_sum = 0;
     for (int k = threadIdx.x; k < K; k += blockDim.x) {
         float v = __bfloat162float(x_row[k]);
+        if (smooth) v /= smooth[k];
         int q = __float2int_rn(v * inv_scale);
         q = max(-128, min(127, q));
         out_row[k] = (int8_t)q;
@@ -1388,10 +1391,10 @@ __global__ void quantize_activations_kernel(
 
 void quantize_activations_int8_cuda(const __nv_bfloat16* X, int8_t* X_int8,
                                      float* x_scale, float* x_rowsum,
-                                     int M, int K) {
+                                     int M, int K, const float* smooth) {
     int threads = 256;
     quantize_activations_kernel<<<M, threads, threads * sizeof(float)>>>(
-        X, X_int8, x_scale, x_rowsum, M, K);
+        X, X_int8, x_scale, x_rowsum, smooth, M, K);
 }
 
 // ============================================================================
@@ -1903,3 +1906,55 @@ void fused_dequant_gemm_cuda(const __nv_bfloat16* X, const int8_t* W,
 #undef FUSED_BM
 #undef FUSED_BN
 #undef FUSED_PAD
+
+// ============================================================================
+// SmoothQuant: divide BF16 [M, K] activations by float [K] smooth factors
+// out[m,k] = X[m,k] / smooth[k]
+// ============================================================================
+
+__global__ void smooth_div_bf16_kernel(
+    const __nv_bfloat16* __restrict__ X,
+    const float* __restrict__ smooth,
+    __nv_bfloat16* __restrict__ out,
+    int M, int K)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = M * K;
+    if (idx >= total) return;
+    int k = idx % K;
+    float v = __bfloat162float(X[idx]) / smooth[k];
+    out[idx] = __float2bfloat16(v);
+}
+
+void smooth_div_bf16_cuda(const __nv_bfloat16* X, const float* smooth,
+                           __nv_bfloat16* out, int M, int K) {
+    int threads = 256;
+    int total = M * K;
+    int blocks = (total + threads - 1) / threads;
+    smooth_div_bf16_kernel<<<blocks, threads>>>(X, smooth, out, M, K);
+}
+
+// ============================================================================
+// Calibration: per-column absmax of BF16 [M, K] matrix
+// Accumulates (element-wise max) into existing [K] float buffer.
+// ============================================================================
+
+__global__ void calibrate_act_absmax_kernel(
+    const __nv_bfloat16* __restrict__ X,  // [M, K]
+    float* __restrict__ accum,            // [K] running max (read-modify-write)
+    int M, int K)
+{
+    int k = blockIdx.x * blockDim.x + threadIdx.x;
+    if (k >= K) return;
+    float mx = 0.0f;
+    for (int m = 0; m < M; m++) {
+        mx = fmaxf(mx, fabsf(__bfloat162float(X[(int64_t)m * K + k])));
+    }
+    accum[k] = fmaxf(accum[k], mx);
+}
+
+void calibrate_act_absmax_cuda(const __nv_bfloat16* X, float* accum, int M, int K) {
+    int threads = 256;
+    int blocks = (K + threads - 1) / threads;
+    calibrate_act_absmax_kernel<<<blocks, threads>>>(X, accum, M, K);
+}
