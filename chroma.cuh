@@ -342,6 +342,9 @@ struct ChromaRadiance {
     static constexpr int nerf_max_freqs = 8;
     static constexpr int mod_index_length = 344;
 
+    // Cached constant: mod_index_emb [344, 32] F32 (computed once, reused across steps)
+    Tensor cached_mod_index_emb;
+
     // GPU arena: single allocation for all weights (declared first → destroyed last)
     GPUArena weight_arena;
 
@@ -472,13 +475,15 @@ struct ChromaRadiance {
         Tensor ts_guidance = Tensor::alloc({1, 32}, DType::F32, true);
         concat_last_dim_cuda(ts_emb.f32(), g_emb.f32(), ts_guidance.f32(), 1, 16, 16);
 
-        // timestep_embedding(arange(0..344), 32) → [344, 32]
-        std::vector<float> arange(mod_index_length);
-        for (int i = 0; i < mod_index_length; i++) arange[i] = (float)i;
-        Tensor ar_gpu = Tensor::alloc({(int64_t)mod_index_length}, DType::F32, true);
-        CHECK_CUDA(cudaMemcpy(ar_gpu.data, arange.data(), mod_index_length * sizeof(float), cudaMemcpyHostToDevice));
-        Tensor mod_index_emb = Tensor::alloc({(int64_t)mod_index_length, 32}, DType::F32, true);
-        timestep_embedding_cuda(ar_gpu.f32(), mod_index_emb.f32(), mod_index_length, 32, 1000.0f, 10000.0f);
+        // Cache mod_index_emb (constant across all steps)
+        if (!cached_mod_index_emb.data) {
+            std::vector<float> arange(mod_index_length);
+            for (int i = 0; i < mod_index_length; i++) arange[i] = (float)i;
+            Tensor ar_gpu = Tensor::alloc({(int64_t)mod_index_length}, DType::F32, true);
+            CHECK_CUDA(cudaMemcpy(ar_gpu.data, arange.data(), mod_index_length * sizeof(float), cudaMemcpyHostToDevice));
+            cached_mod_index_emb = Tensor::alloc({(int64_t)mod_index_length, 32}, DType::F32, true);
+            timestep_embedding_cuda(ar_gpu.f32(), cached_mod_index_emb.f32(), mod_index_length, 32, 1000.0f, 10000.0f);
+        }
 
         // Broadcast ts_guidance [1, 32] → [344, 32]
         Tensor ts_guidance_broad = Tensor::alloc({(int64_t)mod_index_length, 32}, DType::F32, true);
@@ -486,7 +491,7 @@ struct ChromaRadiance {
 
         // concat → [344, 64]
         Tensor vec = Tensor::alloc({(int64_t)mod_index_length, 64}, DType::F32, true);
-        concat_last_dim_cuda(ts_guidance_broad.f32(), mod_index_emb.f32(), vec.f32(),
+        concat_last_dim_cuda(ts_guidance_broad.f32(), cached_mod_index_emb.f32(), vec.f32(),
                              mod_index_length, 32, 32);
 
         // Forward through ChromaApproximator → [344, 3072]
@@ -842,7 +847,7 @@ struct ChromaRadiance {
     // NeRF decoder
     // ======================================================================
     Tensor nerf_decode(const Tensor& transformer_out, const Tensor& orig_img,
-                       const std::vector<float>& dct_features,
+                       const Tensor& dct_features,
                        int H, int W) {
         int h_patches = H / patch_size;
         int w_patches = W / patch_size;
@@ -859,16 +864,10 @@ struct ChromaRadiance {
         permute_3d_cuda(patches.f32(), patches_perm.f32(),
                         num_patches, 3, pixels_per_patch, 0, 2, 1);
 
-        // 2. Upload DCT features [256, 64] and concat with patches
-        Tensor dct_gpu = Tensor::alloc({(int64_t)pixels_per_patch, (int64_t)(nerf_max_freqs * nerf_max_freqs)},
-                                        DType::F32, true);
-        CHECK_CUDA(cudaMemcpy(dct_gpu.data, dct_features.data(),
-                              dct_features.size() * sizeof(float), cudaMemcpyHostToDevice));
-
-        // Broadcast DCT to [num_patches, 256, 64] using single kernel
+        // 2. Broadcast pre-uploaded DCT features [256, 64] to [num_patches, 256, 64]
         Tensor dct_broad = Tensor::alloc({(int64_t)num_patches, (int64_t)pixels_per_patch,
                                            (int64_t)(nerf_max_freqs * nerf_max_freqs)}, DType::F32, true);
-        broadcast_rows_cuda(dct_gpu.f32(), dct_broad.f32(), num_patches,
+        broadcast_rows_cuda(dct_features.f32(), dct_broad.f32(), num_patches,
                             pixels_per_patch, nerf_max_freqs * nerf_max_freqs);
 
         // Concat: [num_patches, 256, 3] + [num_patches, 256, 64] → [num_patches, 256, 67]
@@ -982,9 +981,9 @@ struct ChromaRadiance {
         l2_norm_cuda(w_value.f32(), w_value.f32(), batch * mlp_dim, hid, 1e-12f);
         l2_norm_cuda(w_fc2.f32(), w_fc2.f32(), batch * hid, mlp_dim, 1e-12f);
 
-        // Save residual
+        // Save residual (async D2D — no CPU sync needed)
         Tensor res = Tensor::alloc({batch, seq, hid}, DType::F32, true);
-        CHECK_CUDA(cudaMemcpy(res.data, x.data, batch * seq * hid * sizeof(float), cudaMemcpyDeviceToDevice));
+        CHECK_CUDA(cudaMemcpyAsync(res.data, x.data, batch * seq * hid * sizeof(float), cudaMemcpyDeviceToDevice));
 
         // RMSNorm on x
         Tensor x_normed = Tensor::alloc({batch, seq, hid}, DType::F32, true);
@@ -1052,11 +1051,9 @@ struct ChromaRadiance {
     }
 
     Tensor forward(const Tensor& x, const Tensor& context, float timestep,
-                    const Tensor& pe, const std::vector<float>& dct_features,
+                    const Tensor& pe, const Tensor& dct_features,
                     const float* attn_mask = nullptr) {
-        // Release cached activation buffers from the previous forward pass
-        // (different phases use incompatible sizes, so stale caches just waste VRAM)
-        gpu_pool().release_all();
+        // GPU pool reuses activation buffers by size across steps — no release needed
 
         int H = x.shape[2], W = x.shape[3];
         int64_t txt_tokens = context.shape[0];
@@ -1164,19 +1161,15 @@ struct ChromaRadiance {
             single_block_forward(i, combined, mod, pe, attn_mask);
         }
 
-        // 7. Extract img tokens (last img_tokens entries)
-        Tensor img_out = Tensor::alloc({img_tokens, (int64_t)hidden_size}, DType::F32, true);
-        CHECK_CUDA(cudaMemcpy(img_out.data,
-                              combined.f32() + txt_tokens * hidden_size,
-                              img_tokens * hidden_size * sizeof(float),
-                              cudaMemcpyDeviceToDevice));
+        // 7. Extract img tokens — zero-copy view into combined (no D2D copy needed)
+        Tensor img_out = Tensor::wrap_gpu(combined.f32() + txt_tokens * hidden_size,
+                                           {img_tokens, (int64_t)hidden_size}, DType::F32);
 
         if (diag) {
             print_tensor_stats("transformer_out (img_out)", img_out.f32(), img_out.numel());
         }
 
-        // Release cached single-block activation buffers (not reused by NeRF)
-        gpu_pool().release_all();
+        // Pool keeps single-block buffers for reuse (NeRF allocates different sizes from pool)
 
         // 8. NeRF decode
         Tensor output = nerf_decode(img_out, x, dct_features, H, W);

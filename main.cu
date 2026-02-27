@@ -394,10 +394,16 @@ int main(int argc, char** argv) {
     CHECK_CUDA(cudaMemcpy(pe.data, pe_vec.data(), pe_vec.size() * sizeof(float),
                           cudaMemcpyHostToDevice));
 
-    // DCT features for NeRF decoder
-    auto dct_features = compute_dct_features(ChromaRadiance::patch_size,
-                                              ChromaRadiance::nerf_max_freqs);
-    printf("DCT features: %zu values\n", dct_features.size());
+    // DCT features for NeRF decoder — upload to GPU once (avoids H2D every step)
+    auto dct_features_vec = compute_dct_features(ChromaRadiance::patch_size,
+                                                  ChromaRadiance::nerf_max_freqs);
+    Tensor dct_features = Tensor::alloc(
+        {(int64_t)(ChromaRadiance::patch_size * ChromaRadiance::patch_size),
+         (int64_t)(ChromaRadiance::nerf_max_freqs * ChromaRadiance::nerf_max_freqs)},
+        DType::F32, true);
+    CHECK_CUDA(cudaMemcpy(dct_features.data, dct_features_vec.data(),
+                          dct_features_vec.size() * sizeof(float), cudaMemcpyHostToDevice));
+    printf("DCT features: %zu values (GPU)\n", dct_features_vec.size());
 
     // Attention mask: block attending to padding tokens in T5 context
     // Matches sd.cpp's chroma_use_dit_mask=true (default)
@@ -428,6 +434,9 @@ int main(int argc, char** argv) {
     if (use_cfg) {
         attn_mask_uncond = make_attn_mask(n_real_tokens_uncond, "-");
     }
+
+    // Pre-build cuDNN SDPA graph (avoids 32ms one-time cost during first sampling step)
+    build_sdpa_graph(ChromaRadiance::num_heads, total_tokens, ChromaRadiance::d_head, true);
 
     // ========================================
     // Phase 4: Sampling
