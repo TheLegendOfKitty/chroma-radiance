@@ -54,6 +54,21 @@ void concat_quantize_int8_cuda(const float* a, const float* b,
                                 const float* smooth,
                                 int8_t* X_int8, float* x_scale, float* x_rowsum,
                                 int M, int Da, int Db, bool need_rowsum);
+void int8_dequant_qknorm_rope_bf16_cuda(
+    const int32_t* gemm_out, const float* x_scale,
+    const void* w_scale, int w_scale_dtype,
+    const int8_t* zp, const float* x_rowsum, const float* bias,
+    const float* norm_weight, const float* pe,
+    __nv_bfloat16* output,
+    int M, int N, int n_head, int d_head,
+    int L_stride, int token_offset, int pe_token_offset);
+void int8_dequant_permute_bf16_cuda(
+    const int32_t* gemm_out, const float* x_scale,
+    const void* w_scale, int w_scale_dtype,
+    const int8_t* zp, const float* x_rowsum, const float* bias,
+    __nv_bfloat16* output,
+    int M, int N, int n_head, int d_head,
+    int L_stride, int token_offset);
 
 #define CHECK_CUBLAS(call) do { \
     cublasStatus_t err = (call); \
@@ -274,8 +289,8 @@ static void linear_lt(int64_t M, int64_t K, int64_t N,
 
 // INT8 x INT8 → INT32 GEMM via cublasLt with INT8 tensor cores
 // Y_int32[M,N] = X_int8[M,K] @ W_int8[N,K]^T
-// Caches cublasLt descriptors (matmul_desc + 3 layouts + heuristic algo) per (M,K,N)
-// to avoid repeated creation/destruction (~456 calls/step × ~10µs = ~4.6ms saved).
+// Caches cublasLt descriptors (matmul_desc + 3 layouts) per (M,K,N).
+// Uses heuristic top-1 algorithm (no benchmarking).
 static void linear_int8_gemm(int64_t M, int64_t K, int64_t N,
                                const int8_t* x_int8, const int8_t* w_int8,
                                int32_t* Y_int32) {
@@ -301,7 +316,7 @@ static void linear_int8_gemm(int64_t M, int64_t K, int64_t N,
         CHECK_CUBLAS(cublasLtMatrixLayoutCreate(&c.layout_b, CUDA_R_8I, K, M, K));
         CHECK_CUBLAS(cublasLtMatrixLayoutCreate(&c.layout_c, CUDA_R_32I, N, M, N));
 
-        // Heuristic algorithm selection
+        // Use heuristic top-1 algorithm
         cublasLtMatmulPreference_t pref;
         CHECK_CUBLAS(cublasLtMatmulPreferenceCreate(&pref));
         CHECK_CUBLAS(cublasLtMatmulPreferenceSetAttribute(pref,
@@ -310,14 +325,15 @@ static void linear_int8_gemm(int64_t M, int64_t K, int64_t N,
 
         cublasLtMatmulHeuristicResult_t heuristic;
         int n_results = 0;
-        cublasStatus_t heur_status = cublasLtMatmulAlgoGetHeuristic(g_cublaslt,
-            c.matmul_desc, c.layout_a, c.layout_b, c.layout_c, c.layout_c,
-            pref, 1, &heuristic, &n_results);
-
-        c.algo_valid = (heur_status == CUBLAS_STATUS_SUCCESS && n_results > 0);
-        if (c.algo_valid) c.algo = heuristic.algo;
-
+        c.algo_valid = false;
+        if (cublasLtMatmulAlgoGetHeuristic(g_cublaslt,
+                c.matmul_desc, c.layout_a, c.layout_b, c.layout_c, c.layout_c,
+                pref, 1, &heuristic, &n_results) == CUBLAS_STATUS_SUCCESS && n_results > 0) {
+            c.algo = heuristic.algo;
+            c.algo_valid = true;
+        }
         cublasLtMatmulPreferenceDestroy(pref);
+
         it = g_int8_cache.emplace(cache_key, c).first;
     }
 

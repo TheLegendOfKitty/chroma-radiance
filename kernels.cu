@@ -3067,3 +3067,191 @@ void permute_and_convert_to_bf16_cuda(const float* src, __nv_bfloat16* dst,
     int blocks = (int)((total + threads - 1) / threads);
     permute_and_convert_to_bf16_kernel<<<blocks, threads>>>(src, dst, n_head, L, d_head);
 }
+
+// ============================================================================
+// Fused INT32 dequant + RMSNorm (QK-norm) + RoPE + permute → BF16
+// For Q and K in per-channel INT8 attention path.
+//
+// Input:  INT32 GEMM output [M, N] where N = n_head * d_head
+// Output: BF16 [n_head, L_stride, d_head] with tokens placed at token_offset
+//
+// One block per (token, head). d_head threads per block (128 = 4 warps).
+// Shared memory: 4 floats for cross-warp RMSNorm reduction.
+// RoPE pair sharing via __shfl_xor_sync (adjacent threads = same warp).
+// ============================================================================
+
+template<bool HAS_ZP>
+__global__ void int8_dequant_qknorm_rope_bf16_kernel(
+    const int32_t* __restrict__ gemm_out,      // [M, N] INT32
+    const float* __restrict__ x_scale,         // [M]
+    const void* __restrict__ w_scale,          // [N] F32/FP16/BF16
+    int w_scale_dtype,
+    const int8_t* __restrict__ zp,             // [N] or nullptr
+    const float* __restrict__ x_rowsum,        // [M] or nullptr
+    const float* __restrict__ bias,            // [N] or nullptr
+    const float* __restrict__ norm_weight,     // [d_head]
+    const float* __restrict__ pe,              // [pe_L, half_d * 4]
+    __nv_bfloat16* __restrict__ output,        // [n_head, L_stride, d_head] BF16
+    int M, int N, int n_head, int d_head,
+    int L_stride, int token_offset, int pe_token_offset)
+{
+    __shared__ float s_reduce[4];
+
+    int token = blockIdx.x;  // which token in [0, M)
+    int head = blockIdx.y;   // which head in [0, n_head)
+    int d = threadIdx.x;     // element within head [0, d_head)
+
+    // 1. Dequant INT32 → F32
+    int col = head * d_head + d;
+    int32_t i32_val = gemm_out[token * N + col];
+    float xs = x_scale[token];
+    float ws = load_quant_scale_device(w_scale, w_scale_dtype, (int64_t)col);
+
+    float val;
+    if constexpr (HAS_ZP) {
+        val = xs * ws * ((float)i32_val - (float)zp[col] * x_rowsum[token]);
+    } else {
+        val = xs * ws * (float)i32_val;
+    }
+    if (bias) val += bias[col];
+
+    // 2. RMSNorm: compute sum of squares across d_head elements
+    float sq = val * val;
+
+    // Warp-level reduction (32 threads per warp)
+    for (int offset = 16; offset >= 1; offset >>= 1)
+        sq += __shfl_xor_sync(0xFFFFFFFF, sq, offset);
+
+    // Cross-warp reduction via shared memory (4 warps for d_head=128)
+    int warp_id = threadIdx.x / 32;
+    int lane = threadIdx.x % 32;
+    if (lane == 0) s_reduce[warp_id] = sq;
+    __syncthreads();
+
+    float rms;
+    if (threadIdx.x == 0) {
+        float total_sq = s_reduce[0] + s_reduce[1] + s_reduce[2] + s_reduce[3];
+        s_reduce[0] = rsqrtf(total_sq / (float)d_head + 1e-6f);
+    }
+    __syncthreads();
+    rms = s_reduce[0];
+
+    // Apply norm
+    float norm_val = val * rms * norm_weight[d];
+
+    // 3. RoPE rotation using warp shuffle for pair sharing
+    // Adjacent threads (2j, 2j+1) are always in the same warp
+    float partner = __shfl_xor_sync(0xFFFFFFFF, norm_val, 1);
+    float x_even, x_odd;
+    if (d & 1) { x_even = partner; x_odd = norm_val; }
+    else       { x_even = norm_val; x_odd = partner; }
+
+    int half_d = d_head / 2;
+    int pair = d / 2;
+    int pe_base = (pe_token_offset + token) * half_d * 4 + pair * 4;
+    float pe_cos     = pe[pe_base + 0];
+    float pe_neg_sin = pe[pe_base + 1];
+    float pe_sin     = pe[pe_base + 2];
+    float pe_cos2    = pe[pe_base + 3];
+
+    float result;
+    if (!(d & 1)) result = x_even * pe_cos + x_odd * pe_neg_sin;
+    else          result = x_even * pe_sin + x_odd * pe_cos2;
+
+    // 4. Write BF16 to permuted [n_head, L_stride, d_head] layout
+    int64_t out_idx = (int64_t)head * L_stride * d_head
+                    + (int64_t)(token_offset + token) * d_head + d;
+    output[out_idx] = __float2bfloat16(result);
+}
+
+void int8_dequant_qknorm_rope_bf16_cuda(
+    const int32_t* gemm_out, const float* x_scale,
+    const void* w_scale, int w_scale_dtype,
+    const int8_t* zp, const float* x_rowsum, const float* bias,
+    const float* norm_weight, const float* pe,
+    __nv_bfloat16* output,
+    int M, int N, int n_head, int d_head,
+    int L_stride, int token_offset, int pe_token_offset)
+{
+    dim3 grid(M, n_head);
+    dim3 block(d_head);
+    if (zp) {
+        int8_dequant_qknorm_rope_bf16_kernel<true><<<grid, block>>>(
+            gemm_out, x_scale, w_scale, w_scale_dtype, zp, x_rowsum, bias,
+            norm_weight, pe, output, M, N, n_head, d_head,
+            L_stride, token_offset, pe_token_offset);
+    } else {
+        int8_dequant_qknorm_rope_bf16_kernel<false><<<grid, block>>>(
+            gemm_out, x_scale, w_scale, w_scale_dtype, zp, x_rowsum, bias,
+            norm_weight, pe, output, M, N, n_head, d_head,
+            L_stride, token_offset, pe_token_offset);
+    }
+}
+
+// ============================================================================
+// Fused INT32 dequant + permute → BF16 (for V — no norm or RoPE)
+//
+// Input:  INT32 GEMM output [M, N] where N = n_head * d_head
+// Output: BF16 [n_head, L_stride, d_head] with tokens placed at token_offset
+//
+// One block per (token, head). d_head threads per block.
+// No shared memory needed.
+// ============================================================================
+
+template<bool HAS_ZP>
+__global__ void int8_dequant_permute_bf16_kernel(
+    const int32_t* __restrict__ gemm_out,      // [M, N] INT32
+    const float* __restrict__ x_scale,         // [M]
+    const void* __restrict__ w_scale,          // [N] F32/FP16/BF16
+    int w_scale_dtype,
+    const int8_t* __restrict__ zp,             // [N] or nullptr
+    const float* __restrict__ x_rowsum,        // [M] or nullptr
+    const float* __restrict__ bias,            // [N] or nullptr
+    __nv_bfloat16* __restrict__ output,        // [n_head, L_stride, d_head] BF16
+    int M, int N, int n_head, int d_head,
+    int L_stride, int token_offset)
+{
+    int token = blockIdx.x;
+    int head = blockIdx.y;
+    int d = threadIdx.x;
+
+    // Dequant INT32 → F32
+    int col = head * d_head + d;
+    int32_t i32_val = gemm_out[token * N + col];
+    float xs = x_scale[token];
+    float ws = load_quant_scale_device(w_scale, w_scale_dtype, (int64_t)col);
+
+    float val;
+    if constexpr (HAS_ZP) {
+        val = xs * ws * ((float)i32_val - (float)zp[col] * x_rowsum[token]);
+    } else {
+        val = xs * ws * (float)i32_val;
+    }
+    if (bias) val += bias[col];
+
+    // Write BF16 to permuted [n_head, L_stride, d_head] layout
+    int64_t out_idx = (int64_t)head * L_stride * d_head
+                    + (int64_t)(token_offset + token) * d_head + d;
+    output[out_idx] = __float2bfloat16(val);
+}
+
+void int8_dequant_permute_bf16_cuda(
+    const int32_t* gemm_out, const float* x_scale,
+    const void* w_scale, int w_scale_dtype,
+    const int8_t* zp, const float* x_rowsum, const float* bias,
+    __nv_bfloat16* output,
+    int M, int N, int n_head, int d_head,
+    int L_stride, int token_offset)
+{
+    dim3 grid(M, n_head);
+    dim3 block(d_head);
+    if (zp) {
+        int8_dequant_permute_bf16_kernel<true><<<grid, block>>>(
+            gemm_out, x_scale, w_scale, w_scale_dtype, zp, x_rowsum, bias,
+            output, M, N, n_head, d_head, L_stride, token_offset);
+    } else {
+        int8_dequant_permute_bf16_kernel<false><<<grid, block>>>(
+            gemm_out, x_scale, w_scale, w_scale_dtype, zp, x_rowsum, bias,
+            output, M, N, n_head, d_head, L_stride, token_offset);
+    }
+}
