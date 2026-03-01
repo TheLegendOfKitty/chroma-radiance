@@ -453,6 +453,9 @@ def quantize_weights(input_path: str, output_path: str, group_size: int = 128,
             w = tensor.float()  # [N, K]
             N, K = w.shape
 
+            # Clamp group_size to K so per-channel doesn't pad
+            layer_group_size = min(group_size, K)
+
             if use_gpu:
                 w = w.to(dev)
 
@@ -464,7 +467,7 @@ def quantize_weights(input_path: str, output_path: str, group_size: int = 128,
                 if act_abs is not None:
                     act_abs = act_abs.float().to(w.device)
                     smooth, best_alpha, clip_ratio = compute_awq_scales(
-                        w, act_abs, group_size, asymmetric, use_clip_mse)
+                        w, act_abs, layer_group_size, asymmetric, use_clip_mse)
                     w = w * smooth.unsqueeze(0)
             elif smooth_alpha > 0:
                 act_abs = calib_data.get(name)
@@ -484,16 +487,16 @@ def quantize_weights(input_path: str, output_path: str, group_size: int = 128,
 
             # Step 3: MSE-optimal clipping (if not already done by AWQ)
             if use_clip_mse and clip_ratio is None:
-                clip_ratio = find_optimal_clip_ratio(w, group_size, asymmetric)
+                clip_ratio = find_optimal_clip_ratio(w, layer_group_size, asymmetric)
 
             # Step 4: Compute per-group quantization parameters
-            scale, zero_point = compute_group_params(w, group_size, asymmetric, clip_ratio)
+            scale, zero_point = compute_group_params(w, layer_group_size, asymmetric, clip_ratio)
 
             # Step 5: Quantize (GPTQ or standard round-to-nearest)
             if use_gptq:
-                w_int8 = gptq_quantize(w, scale, zero_point, group_size)
+                w_int8 = gptq_quantize(w, scale, zero_point, layer_group_size)
             else:
-                w_int8 = standard_quantize(w, scale, zero_point, group_size)
+                w_int8 = standard_quantize(w, scale, zero_point, layer_group_size)
 
             # Move results to CPU for storage
             w_int8 = w_int8.cpu()
@@ -610,7 +613,12 @@ if __name__ == "__main__":
                         help="Calibration file (safetensors) with per-channel activation absmax")
     parser.add_argument("--hadamard", action="store_true",
                         help="Apply Hadamard rotation to weight K dimensions before quantization (improves per-channel INT8)")
+    parser.add_argument("--per-channel", action="store_true",
+                        help="Per-channel quantization (sets group_size = K per layer, uses INT8 tensor cores at runtime)")
     args = parser.parse_args()
+
+    if args.per_channel:
+        args.group_size = 999999  # Will be clamped to K per layer
 
     if args.group_size < 1:
         print("Error: --group-size must be >= 1")
