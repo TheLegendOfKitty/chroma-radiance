@@ -48,6 +48,10 @@ void softmax_cuda(const float* x, float* out, int64_t rows, int64_t C);
 void batched_transpose_2d_cuda(const float* input, float* output,
                                 int64_t batch, int64_t rows, int64_t cols);
 void scale_cuda(float* x, float scale, int64_t n);
+void cfg_blend_cuda(const float* cond, const float* uncond, float* out,
+                     float cfg_scale, int64_t n);
+void rms_norm_nchw_cuda(const float* input, const float* scale, float* output,
+                         int C, int H, int W, float eps);
 void slice_columns_cuda(const float* src, float* dst,
                          int64_t L, int64_t total_cols,
                          int64_t col_offset, int64_t slice_cols);
@@ -1041,17 +1045,13 @@ struct ChromaRadiance {
         unpatchify_cuda(for_unpatch.f32(), img_out.f32(), 1, nerf_hidden, H, W, patch_size,
                         h_patches, w_patches);
 
-        // 8. NerfFinalLayerConv: permute to [1, H, W, 64], RMSNorm, permute back, Conv2d(64→3)
-        Tensor nhwc = Tensor::alloc({1, (int64_t)H, (int64_t)W, (int64_t)nerf_hidden},
-                                     DType::F32, true);
-        permute_4d_cuda(img_out.f32(), nhwc.f32(), 1, nerf_hidden, H, W, 0, 2, 3, 1);
-
-        rms_norm_cuda(nhwc.f32(), nerf_small.final_norm_scale.f32(), nhwc.f32(),
-                      (int64_t)H * W, nerf_hidden, 1e-6f);
-
+        // 8. NerfFinalLayerConv: fused NCHW RMSNorm + Conv2d(64→3)
+        // Fused kernel normalizes across C at each (h,w) directly in NCHW layout
+        // Replaces: NCHW→NHWC permute + RMSNorm + NHWC→NCHW permute (3 kernels → 1)
         Tensor nchw = Tensor::alloc({1, (int64_t)nerf_hidden, (int64_t)H, (int64_t)W},
                                      DType::F32, true);
-        permute_4d_cuda(nhwc.f32(), nchw.f32(), 1, H, W, nerf_hidden, 0, 3, 1, 2);
+        rms_norm_nchw_cuda(img_out.f32(), nerf_small.final_norm_scale.f32(), nchw.f32(),
+                            nerf_hidden, H, W, 1e-6f);
 
         Tensor final_out = Tensor::alloc({1, 3, (int64_t)H, (int64_t)W}, DType::F32, true);
         conv2d_3x3_cuda(nchw.f32(), nerf_small.final_conv_w.f32(), nerf_small.final_conv_b.f32(),
@@ -1173,7 +1173,9 @@ struct ChromaRadiance {
 
     Tensor forward(const Tensor& x, const Tensor& context, float timestep,
                     const Tensor& pe, const Tensor& dct_features,
-                    const float* attn_mask = nullptr) {
+                    const float* attn_mask = nullptr,
+                    const Tensor* shared_img = nullptr,
+                    const Tensor* shared_mod = nullptr) {
         // GPU pool reuses activation buffers by size across steps — no release needed
 
         int H = x.shape[2], W = x.shape[3];
@@ -1204,8 +1206,16 @@ struct ChromaRadiance {
             }
         }
 
-        // 1. Image tokenization: Conv2d
-        Tensor img = conv2d_img_in(x, H, W);
+        // 1. Image tokenization: Conv2d (or clone precomputed for CFG sharing)
+        Tensor img;
+        if (shared_img) {
+            // Clone shared img (blocks modify it in-place via gated_residual)
+            img = Tensor::alloc({shared_img->shape[0], shared_img->shape[1]}, shared_img->dtype, true);
+            CHECK_CUDA(cudaMemcpyAsync(img.data, shared_img->data, shared_img->nbytes(),
+                                        cudaMemcpyDeviceToDevice));
+        } else {
+            img = conv2d_img_in(x, H, W);
+        }
         int64_t img_tokens = img.shape[0];
 
         if (diag) {
@@ -1253,8 +1263,17 @@ struct ChromaRadiance {
             print_tensor_stats("txt_after_proj", txt.f32(), txt.numel());
         }
 
-        // 3. Compute modulation vectors (uses ChromaApproximator)
-        Tensor mod = compute_modulation(timestep, 0.0f);
+        // 3. Compute or reuse modulation vectors (shared_mod avoids recomputing for CFG)
+        Tensor mod_view;
+        if (shared_mod) {
+            mod_view = Tensor::wrap_gpu(shared_mod->data,
+                                         {(int64_t)mod_index_length, (int64_t)hidden_size}, DType::F32);
+        }
+        Tensor mod_owned;
+        if (!shared_mod) {
+            mod_owned = compute_modulation(timestep, 0.0f);
+        }
+        const Tensor& mod = shared_mod ? mod_view : mod_owned;
 
         if (diag) {
             print_tensor_stats("modulation", mod.f32(), mod.numel());

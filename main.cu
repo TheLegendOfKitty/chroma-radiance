@@ -466,13 +466,17 @@ int main(int argc, char** argv) {
         auto step_start = std::chrono::high_resolution_clock::now();
 
         if (use_cfg) {
+            // Precompute shared work: image tokenization + modulation (same x and timestep)
+            Tensor img_base = chroma.conv2d_img_in(x, args.height, args.width);
+            Tensor mod = chroma.compute_modulation(sigma, 0.0f);
+
             // Two-pass CFG: guided = uncond + cfg * (cond - uncond)
-            Tensor velocity_cond = chroma.forward(x, context, sigma, pe, dct_features, attn_mask.f32());
-            Tensor velocity_uncond = chroma.forward(x, context_uncond, sigma, pe, dct_features, attn_mask_uncond.f32());
+            Tensor velocity_cond = chroma.forward(x, context, sigma, pe, dct_features, attn_mask.f32(), &img_base, &mod);
+            Tensor velocity_uncond = chroma.forward(x, context_uncond, sigma, pe, dct_features, attn_mask_uncond.f32(), &img_base, &mod);
+
+            // Fused CFG blend: 1 kernel instead of 3 (add_scaled + scale + add)
             int64_t n = velocity_cond.numel();
-            add_scaled_cuda(velocity_cond.f32(), velocity_uncond.f32(), velocity_cond.f32(), -1.0f, n);
-            scale_cuda(velocity_cond.f32(), args.cfg_scale, n);
-            add_cuda(velocity_cond.f32(), velocity_uncond.f32(), velocity_cond.f32(), n);
+            cfg_blend_cuda(velocity_cond.f32(), velocity_uncond.f32(), velocity_cond.f32(), args.cfg_scale, n);
 
             // Diagnostic: print guided velocity stats for step 0
             if (args.debug && step == 0) {

@@ -207,6 +207,58 @@ void rms_norm_cuda(const float* x, const float* scale, float* out, int64_t rows,
 }
 
 // ============================================================================
+// Fused NCHW RMSNorm: reads [1, C, H, W], normalizes across C at each (h,w), writes [1, C, H, W]
+// Replaces NCHW→NHWC permute + RMSNorm + NHWC→NCHW permute (3 kernels, 3 passes → 1 kernel, 1 pass)
+// Each block handles one spatial position (h*W + w) with C threads
+// ============================================================================
+__global__ void rms_norm_nchw_kernel(const float* input, const float* scale,
+                                      float* output, int C, int HW, float eps) {
+    int hw = blockIdx.x;
+    if (hw >= HW) return;
+    int c = threadIdx.x;
+    if (c >= C) return;
+
+    // Read value at this spatial position for channel c
+    // NCHW layout: index = c * HW + hw
+    float val = input[c * HW + hw];
+
+    // Warp-level sum-of-squares reduction
+    float sq = val * val;
+    for (int offset = 16; offset > 0; offset >>= 1)
+        sq += __shfl_xor_sync(0xffffffff, sq, offset);
+
+    // Inter-warp reduction (supports up to 8 warps = 256 channels)
+    int warp_id = c >> 5;
+    int lane = c & 31;
+    int num_warps = (C + 31) >> 5;
+    __shared__ float warp_sums[8];
+    if (lane == 0) warp_sums[warp_id] = sq;
+    __syncthreads();
+
+    float total_sq;
+    if (warp_id == 0) {
+        total_sq = (lane < num_warps) ? warp_sums[lane] : 0.0f;
+        for (int offset = 16; offset > 0; offset >>= 1)
+            total_sq += __shfl_xor_sync(0xffffffff, total_sq, offset);
+        if (lane == 0) warp_sums[0] = total_sq;
+    }
+    __syncthreads();
+    total_sq = warp_sums[0];
+
+    float rms = rsqrtf(total_sq / (float)C + eps);
+    output[c * HW + hw] = val * rms * scale[c];
+}
+
+void rms_norm_nchw_cuda(const float* input, const float* scale, float* output,
+                         int C, int H, int W, float eps) {
+    int HW = H * W;
+    // Round block size up to next power of 2 for warp alignment
+    int threads = 1;
+    while (threads < C) threads <<= 1;
+    rms_norm_nchw_kernel<<<HW, threads>>>(input, scale, output, C, HW, eps);
+}
+
+// ============================================================================
 // GELU (tanh approximation): 0.5*x*(1 + tanh(sqrt(2/pi)*(x + 0.044715*x^3)))
 // Used by Chroma transformer
 // ============================================================================
@@ -382,6 +434,37 @@ void add_scalar_cuda(float* x, float val, int64_t n) {
     int threads = 256;
     int blocks = (n + threads - 1) / threads;
     add_scalar_kernel<<<blocks, threads>>>(x, val, n);
+}
+
+// ============================================================================
+// Fused CFG blend: out = uncond + cfg_scale * (cond - uncond)
+// Replaces 3 separate kernels (add_scaled + scale + add) with 1 vectorized pass
+// ============================================================================
+
+__global__ void cfg_blend_kernel(const float* cond, const float* uncond, float* out,
+                                  float cfg_scale, int64_t n) {
+    int64_t i = ((int64_t)blockIdx.x * blockDim.x + threadIdx.x) * 4;
+    if (i + 3 < n) {
+        float4 vc = *reinterpret_cast<const float4*>(cond + i);
+        float4 vu = *reinterpret_cast<const float4*>(uncond + i);
+        float4 r;
+        r.x = vu.x + cfg_scale * (vc.x - vu.x);
+        r.y = vu.y + cfg_scale * (vc.y - vu.y);
+        r.z = vu.z + cfg_scale * (vc.z - vu.z);
+        r.w = vu.w + cfg_scale * (vc.w - vu.w);
+        *reinterpret_cast<float4*>(out + i) = r;
+    } else {
+        for (int64_t j = i; j < n && j < i + 4; j++)
+            out[j] = uncond[j] + cfg_scale * (cond[j] - uncond[j]);
+    }
+}
+
+void cfg_blend_cuda(const float* cond, const float* uncond, float* out,
+                     float cfg_scale, int64_t n) {
+    int threads = 256;
+    int64_t work = (n + 3) / 4;
+    int blocks = (work + threads - 1) / threads;
+    cfg_blend_kernel<<<blocks, threads>>>(cond, uncond, out, cfg_scale, n);
 }
 
 // ============================================================================
