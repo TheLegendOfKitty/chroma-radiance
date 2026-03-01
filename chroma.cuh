@@ -520,12 +520,16 @@ struct ChromaRadiance {
     void double_block_forward(int block_idx,
                                Tensor& img, Tensor& txt,
                                const Tensor& mod, const Tensor& pe,
-                               const float* attn_mask = nullptr) {
+                               const float* attn_mask = nullptr,
+                               int cfg_batch = 1) {
         const auto& w = double_block_weights[block_idx];
 
         int64_t img_tokens = img.shape[0];
         int64_t txt_tokens = txt.shape[0];
         int64_t total_tokens = img_tokens + txt_tokens;
+        int64_t img_tokens_pb = img_tokens / cfg_batch;
+        int64_t txt_tokens_pb = txt_tokens / cfg_batch;
+        int64_t total_tokens_pb = img_tokens_pb + txt_tokens_pb;
 
         // Get modulation vectors
         int img_off = 6 * block_idx + 3 * depth_single;
@@ -602,90 +606,120 @@ struct ChromaRadiance {
 
         if (use_fused_attn) {
             // Per-channel INT8: fused GEMM → dequant+qknorm+rope+permute → BF16
-            // Bypasses F32 intermediates, qk_norm, and attention_with_rope entirely
-            Tensor Q_bf16 = Tensor::alloc({(int64_t)num_heads, total_tokens, (int64_t)d_head}, DType::BF16, true);
-            Tensor K_bf16 = Tensor::alloc({(int64_t)num_heads, total_tokens, (int64_t)d_head}, DType::BF16, true);
-            Tensor V_bf16 = Tensor::alloc({(int64_t)num_heads, total_tokens, (int64_t)d_head}, DType::BF16, true);
+            // With cfg_batch>1: Q/K/V are [cfg_batch*num_heads, total_tokens_pb, d_head]
+            Tensor Q_bf16 = Tensor::alloc({(int64_t)(cfg_batch * num_heads), total_tokens_pb, (int64_t)d_head}, DType::BF16, true);
+            Tensor K_bf16 = Tensor::alloc({(int64_t)(cfg_batch * num_heads), total_tokens_pb, (int64_t)d_head}, DType::BF16, true);
+            Tensor V_bf16 = Tensor::alloc({(int64_t)(cfg_batch * num_heads), total_tokens_pb, (int64_t)d_head}, DType::BF16, true);
 
             int i32_elems = std::max(img_tokens, txt_tokens) * hidden_size;
             int32_t* i32_scratch = ensure_gemm_i32_scratch(i32_elems);
 
-            // --- Image Q/K/V ---
+            // --- Image Q/K/V (batched GEMM, per-batch fused kernels) ---
             QuantizedAct qa_img = quantize_act_modulate(img.f32(), img_shift1, img_scale1,
                 1e-6f, img_tokens, hidden_size, iq_w.quant_smooth,
                 iq_w.quant_zero_points != nullptr);
             bool need_rowsum_img = (iq_w.quant_zero_points != nullptr);
 
-            // Image Q: GEMM → fused dequant+qknorm+rope → BF16
+            // Image Q: GEMM with M=img_tokens (doubled for cfg_batch=2)
             linear_int8_gemm(img_tokens, hidden_size, hidden_size, qa_img.x_int8, iq_w.i8(), i32_scratch);
-            int8_dequant_qknorm_rope_bf16_cuda(i32_scratch, qa_img.x_scale,
-                iq_w.quant_scales, (int)iq_w.quant_scales_dtype,
-                need_rowsum_img ? (const int8_t*)iq_w.quant_zero_points : nullptr,
-                need_rowsum_img ? qa_img.x_rowsum : nullptr,
-                iq_b.f32(), w.img_q_norm.f32(), pe.f32(), Q_bf16.bf16(),
-                (int)img_tokens, hidden_size, num_heads, d_head,
-                (int)total_tokens, (int)txt_tokens, (int)txt_tokens);
+            for (int b = 0; b < cfg_batch; b++) {
+                int8_dequant_qknorm_rope_bf16_cuda(
+                    i32_scratch + b * img_tokens_pb * hidden_size,
+                    qa_img.x_scale + b * img_tokens_pb,
+                    iq_w.quant_scales, (int)iq_w.quant_scales_dtype,
+                    need_rowsum_img ? (const int8_t*)iq_w.quant_zero_points : nullptr,
+                    need_rowsum_img ? qa_img.x_rowsum + b * img_tokens_pb : nullptr,
+                    iq_b.f32(), w.img_q_norm.f32(), pe.f32(),
+                    Q_bf16.bf16() + (int64_t)b * num_heads * total_tokens_pb * d_head,
+                    (int)img_tokens_pb, hidden_size, num_heads, d_head,
+                    (int)total_tokens_pb, (int)txt_tokens_pb, (int)txt_tokens_pb);
+            }
 
-            // Image K: GEMM → fused dequant+qknorm+rope → BF16
+            // Image K
             linear_int8_gemm(img_tokens, hidden_size, hidden_size, qa_img.x_int8, ik_w.i8(), i32_scratch);
-            int8_dequant_qknorm_rope_bf16_cuda(i32_scratch, qa_img.x_scale,
-                ik_w.quant_scales, (int)ik_w.quant_scales_dtype,
-                need_rowsum_img ? (const int8_t*)ik_w.quant_zero_points : nullptr,
-                need_rowsum_img ? qa_img.x_rowsum : nullptr,
-                ik_b.f32(), w.img_k_norm.f32(), pe.f32(), K_bf16.bf16(),
-                (int)img_tokens, hidden_size, num_heads, d_head,
-                (int)total_tokens, (int)txt_tokens, (int)txt_tokens);
+            for (int b = 0; b < cfg_batch; b++) {
+                int8_dequant_qknorm_rope_bf16_cuda(
+                    i32_scratch + b * img_tokens_pb * hidden_size,
+                    qa_img.x_scale + b * img_tokens_pb,
+                    ik_w.quant_scales, (int)ik_w.quant_scales_dtype,
+                    need_rowsum_img ? (const int8_t*)ik_w.quant_zero_points : nullptr,
+                    need_rowsum_img ? qa_img.x_rowsum + b * img_tokens_pb : nullptr,
+                    ik_b.f32(), w.img_k_norm.f32(), pe.f32(),
+                    K_bf16.bf16() + (int64_t)b * num_heads * total_tokens_pb * d_head,
+                    (int)img_tokens_pb, hidden_size, num_heads, d_head,
+                    (int)total_tokens_pb, (int)txt_tokens_pb, (int)txt_tokens_pb);
+            }
 
             // Image V: GEMM → fused dequant+permute → BF16 (no norm/RoPE)
             linear_int8_gemm(img_tokens, hidden_size, hidden_size, qa_img.x_int8, iv_w.i8(), i32_scratch);
-            int8_dequant_permute_bf16_cuda(i32_scratch, qa_img.x_scale,
-                iv_w.quant_scales, (int)iv_w.quant_scales_dtype,
-                need_rowsum_img ? (const int8_t*)iv_w.quant_zero_points : nullptr,
-                need_rowsum_img ? qa_img.x_rowsum : nullptr,
-                iv_b.f32(), V_bf16.bf16(),
-                (int)img_tokens, hidden_size, num_heads, d_head,
-                (int)total_tokens, (int)txt_tokens);
+            for (int b = 0; b < cfg_batch; b++) {
+                int8_dequant_permute_bf16_cuda(
+                    i32_scratch + b * img_tokens_pb * hidden_size,
+                    qa_img.x_scale + b * img_tokens_pb,
+                    iv_w.quant_scales, (int)iv_w.quant_scales_dtype,
+                    need_rowsum_img ? (const int8_t*)iv_w.quant_zero_points : nullptr,
+                    need_rowsum_img ? qa_img.x_rowsum + b * img_tokens_pb : nullptr,
+                    iv_b.f32(),
+                    V_bf16.bf16() + (int64_t)b * num_heads * total_tokens_pb * d_head,
+                    (int)img_tokens_pb, hidden_size, num_heads, d_head,
+                    (int)total_tokens_pb, (int)txt_tokens_pb);
+            }
 
-            // --- Text Q/K/V ---
+            // --- Text Q/K/V (batched GEMM, per-batch fused kernels) ---
             QuantizedAct qa_txt = quantize_act_modulate(txt.f32(), txt_shift1, txt_scale1,
                 1e-6f, txt_tokens, hidden_size, tq_w.quant_smooth,
                 tq_w.quant_zero_points != nullptr);
             bool need_rowsum_txt = (tq_w.quant_zero_points != nullptr);
 
-            // Text Q: GEMM → fused dequant+qknorm+rope → BF16
+            // Text Q
             linear_int8_gemm(txt_tokens, hidden_size, hidden_size, qa_txt.x_int8, tq_w.i8(), i32_scratch);
-            int8_dequant_qknorm_rope_bf16_cuda(i32_scratch, qa_txt.x_scale,
-                tq_w.quant_scales, (int)tq_w.quant_scales_dtype,
-                need_rowsum_txt ? (const int8_t*)tq_w.quant_zero_points : nullptr,
-                need_rowsum_txt ? qa_txt.x_rowsum : nullptr,
-                tq_b.f32(), w.txt_q_norm.f32(), pe.f32(), Q_bf16.bf16(),
-                (int)txt_tokens, hidden_size, num_heads, d_head,
-                (int)total_tokens, 0, 0);
+            for (int b = 0; b < cfg_batch; b++) {
+                int8_dequant_qknorm_rope_bf16_cuda(
+                    i32_scratch + b * txt_tokens_pb * hidden_size,
+                    qa_txt.x_scale + b * txt_tokens_pb,
+                    tq_w.quant_scales, (int)tq_w.quant_scales_dtype,
+                    need_rowsum_txt ? (const int8_t*)tq_w.quant_zero_points : nullptr,
+                    need_rowsum_txt ? qa_txt.x_rowsum + b * txt_tokens_pb : nullptr,
+                    tq_b.f32(), w.txt_q_norm.f32(), pe.f32(),
+                    Q_bf16.bf16() + (int64_t)b * num_heads * total_tokens_pb * d_head,
+                    (int)txt_tokens_pb, hidden_size, num_heads, d_head,
+                    (int)total_tokens_pb, 0, 0);
+            }
 
             // Text K
             linear_int8_gemm(txt_tokens, hidden_size, hidden_size, qa_txt.x_int8, tk_w.i8(), i32_scratch);
-            int8_dequant_qknorm_rope_bf16_cuda(i32_scratch, qa_txt.x_scale,
-                tk_w.quant_scales, (int)tk_w.quant_scales_dtype,
-                need_rowsum_txt ? (const int8_t*)tk_w.quant_zero_points : nullptr,
-                need_rowsum_txt ? qa_txt.x_rowsum : nullptr,
-                tk_b.f32(), w.txt_k_norm.f32(), pe.f32(), K_bf16.bf16(),
-                (int)txt_tokens, hidden_size, num_heads, d_head,
-                (int)total_tokens, 0, 0);
+            for (int b = 0; b < cfg_batch; b++) {
+                int8_dequant_qknorm_rope_bf16_cuda(
+                    i32_scratch + b * txt_tokens_pb * hidden_size,
+                    qa_txt.x_scale + b * txt_tokens_pb,
+                    tk_w.quant_scales, (int)tk_w.quant_scales_dtype,
+                    need_rowsum_txt ? (const int8_t*)tk_w.quant_zero_points : nullptr,
+                    need_rowsum_txt ? qa_txt.x_rowsum + b * txt_tokens_pb : nullptr,
+                    tk_b.f32(), w.txt_k_norm.f32(), pe.f32(),
+                    K_bf16.bf16() + (int64_t)b * num_heads * total_tokens_pb * d_head,
+                    (int)txt_tokens_pb, hidden_size, num_heads, d_head,
+                    (int)total_tokens_pb, 0, 0);
+            }
 
             // Text V
             linear_int8_gemm(txt_tokens, hidden_size, hidden_size, qa_txt.x_int8, tv_w.i8(), i32_scratch);
-            int8_dequant_permute_bf16_cuda(i32_scratch, qa_txt.x_scale,
-                tv_w.quant_scales, (int)tv_w.quant_scales_dtype,
-                need_rowsum_txt ? (const int8_t*)tv_w.quant_zero_points : nullptr,
-                need_rowsum_txt ? qa_txt.x_rowsum : nullptr,
-                tv_b.f32(), V_bf16.bf16(),
-                (int)txt_tokens, hidden_size, num_heads, d_head,
-                (int)total_tokens, 0);
+            for (int b = 0; b < cfg_batch; b++) {
+                int8_dequant_permute_bf16_cuda(
+                    i32_scratch + b * txt_tokens_pb * hidden_size,
+                    qa_txt.x_scale + b * txt_tokens_pb,
+                    tv_w.quant_scales, (int)tv_w.quant_scales_dtype,
+                    need_rowsum_txt ? (const int8_t*)tv_w.quant_zero_points : nullptr,
+                    need_rowsum_txt ? qa_txt.x_rowsum + b * txt_tokens_pb : nullptr,
+                    tv_b.f32(),
+                    V_bf16.bf16() + (int64_t)b * num_heads * total_tokens_pb * d_head,
+                    (int)txt_tokens_pb, hidden_size, num_heads, d_head,
+                    (int)total_tokens_pb, 0);
+            }
 
-            // cuDNN SDPA directly on fused BF16 buffers
-            Tensor O_bf16 = Tensor::alloc({(int64_t)num_heads, total_tokens, (int64_t)d_head}, DType::BF16, true);
+            // cuDNN SDPA with batch=cfg_batch
+            Tensor O_bf16 = Tensor::alloc({(int64_t)(cfg_batch * num_heads), total_tokens_pb, (int64_t)d_head}, DType::BF16, true);
             cudnn_sdpa_forward(Q_bf16.bf16(), K_bf16.bf16(), V_bf16.bf16(),
-                               attn_mask, O_bf16.bf16(), num_heads, (int)total_tokens, d_head);
+                               attn_mask, O_bf16.bf16(), num_heads, (int)total_tokens_pb, d_head, cfg_batch);
 
             // Check if projection weights support fused unpermute+quantize path
             bool can_fuse_img_proj = (w.img_proj_w.dtype == DType::INT8
@@ -696,34 +730,40 @@ struct ChromaRadiance {
                 && w.txt_proj_w.shape[1] % 4 == 0);
 
             if (can_fuse_img_proj && can_fuse_txt_proj) {
-                // Fused unpermute BF16 → INT8 quantize, called separately for txt and img
-                // Token layout in SDPA output [n_head, total_tokens, d_head]: [txt, img]
+                // Fused unpermute BF16 → INT8 quantize
+                // Layout in INT8 scratch: [txt_all | img_all] for doubled-M projection GEMMs
                 int8_t* attn_i8 = ensure_act_int8_scratch(total_tokens * hidden_size);
                 float* attn_sc = ensure_act_scale_scratch(total_tokens);
                 bool need_rowsum = (w.img_proj_w.quant_zero_points != nullptr);
                 float* attn_rs = need_rowsum ? ensure_act_rowsum_scratch(total_tokens) : nullptr;
 
-                // Text tokens: offset 0 in SDPA output, use txt_proj smooth
-                unpermute_bf16_quantize_int8_cuda(
-                    O_bf16.bf16(),
-                    attn_i8, attn_sc, need_rowsum ? attn_rs : nullptr,
-                    w.txt_proj_w.quant_smooth,
-                    num_heads, (int)total_tokens, d_head,
-                    (int)txt_tokens, 0,
-                    need_rowsum, g_hadamard_enabled);
+                for (int b = 0; b < cfg_batch; b++) {
+                    __nv_bfloat16* O_batch = O_bf16.bf16() + (int64_t)b * num_heads * total_tokens_pb * d_head;
 
-                // Image tokens: offset txt_tokens in SDPA output, use img_proj smooth
-                unpermute_bf16_quantize_int8_cuda(
-                    O_bf16.bf16(),
-                    attn_i8 + txt_tokens * hidden_size,
-                    attn_sc + txt_tokens,
-                    need_rowsum ? attn_rs + txt_tokens : nullptr,
-                    w.img_proj_w.quant_smooth,
-                    num_heads, (int)total_tokens, d_head,
-                    (int)img_tokens, (int)txt_tokens,
-                    need_rowsum, g_hadamard_enabled);
+                    // Text tokens from batch b → attn_i8[b*txt_tokens_pb]
+                    unpermute_bf16_quantize_int8_cuda(
+                        O_batch,
+                        attn_i8 + b * txt_tokens_pb * hidden_size,
+                        attn_sc + b * txt_tokens_pb,
+                        need_rowsum ? attn_rs + b * txt_tokens_pb : nullptr,
+                        w.txt_proj_w.quant_smooth,
+                        num_heads, (int)total_tokens_pb, d_head,
+                        (int)txt_tokens_pb, 0,
+                        need_rowsum, g_hadamard_enabled);
 
-                // Image projection: use pre-quantized INT8 slice
+                    // Image tokens from batch b → attn_i8[txt_tokens + b*img_tokens_pb]
+                    unpermute_bf16_quantize_int8_cuda(
+                        O_batch,
+                        attn_i8 + (txt_tokens + b * img_tokens_pb) * hidden_size,
+                        attn_sc + txt_tokens + b * img_tokens_pb,
+                        need_rowsum ? attn_rs + txt_tokens + b * img_tokens_pb : nullptr,
+                        w.img_proj_w.quant_smooth,
+                        num_heads, (int)total_tokens_pb, d_head,
+                        (int)img_tokens_pb, (int)txt_tokens_pb,
+                        need_rowsum, g_hadamard_enabled);
+                }
+
+                // Image projection: M = img_tokens (doubled for cfg_batch=2)
                 QuantizedAct qa_img_attn;
                 qa_img_attn.x_int8 = attn_i8 + txt_tokens * hidden_size;
                 qa_img_attn.x_scale = attn_sc + txt_tokens;
@@ -733,7 +773,7 @@ struct ChromaRadiance {
                 linear_prequant_gated_residual(qa_img_attn, w.img_proj_w, &w.img_proj_b,
                                                 img.f32(), img_gate1, img_tokens, hidden_size);
 
-                // Text projection: use pre-quantized INT8 slice
+                // Text projection: M = txt_tokens (doubled for cfg_batch=2)
                 QuantizedAct qa_txt_attn;
                 qa_txt_attn.x_int8 = attn_i8;
                 qa_txt_attn.x_scale = attn_sc;
@@ -744,12 +784,30 @@ struct ChromaRadiance {
                                                 txt.f32(), txt_gate1, txt_tokens, hidden_size);
                 fused_attn_proj = true;
             } else {
-                // Fallback: unpermute to F32
+                // Fallback: unpermute to F32 with [txt_all | img_all] layout
                 attn = Tensor::alloc({total_tokens, (int64_t)(num_heads * d_head)}, DType::F32, true);
-                unpermute_bf16_to_f32_cuda(O_bf16.bf16(), attn.f32(), num_heads, (int)total_tokens, d_head);
+                if (cfg_batch == 1) {
+                    unpermute_bf16_to_f32_cuda(O_bf16.bf16(), attn.f32(), num_heads, (int)total_tokens_pb, d_head);
+                } else {
+                    Tensor attn_tmp = Tensor::alloc({total_tokens_pb, (int64_t)(num_heads * d_head)}, DType::F32, true);
+                    for (int b = 0; b < cfg_batch; b++) {
+                        unpermute_bf16_to_f32_cuda(
+                            O_bf16.bf16() + (int64_t)b * num_heads * total_tokens_pb * d_head,
+                            attn_tmp.f32(), num_heads, (int)total_tokens_pb, d_head);
+                        CHECK_CUDA(cudaMemcpyAsync(
+                            attn.f32() + b * txt_tokens_pb * hidden_size,
+                            attn_tmp.f32(),
+                            txt_tokens_pb * hidden_size * sizeof(float), cudaMemcpyDeviceToDevice));
+                        CHECK_CUDA(cudaMemcpyAsync(
+                            attn.f32() + (txt_tokens + b * img_tokens_pb) * hidden_size,
+                            attn_tmp.f32() + txt_tokens_pb * hidden_size,
+                            img_tokens_pb * hidden_size * sizeof(float), cudaMemcpyDeviceToDevice));
+                    }
+                }
             }
         } else {
             // Per-group INT8 or BF16: use F32 Q/K/V + separate qk_norm + attention_with_rope
+            // GEMMs use full doubled M (weights loaded once); attention runs per-batch
             Tensor all_q = Tensor::alloc({total_tokens, (int64_t)hidden_size}, DType::F32, true);
             Tensor all_k = Tensor::alloc({total_tokens, (int64_t)hidden_size}, DType::F32, true);
             Tensor all_v = Tensor::alloc({total_tokens, (int64_t)hidden_size}, DType::F32, true);
@@ -761,7 +819,7 @@ struct ChromaRadiance {
             Tensor img_k_view = Tensor::wrap_gpu(all_k.f32() + txt_tokens * hidden_size, {img_tokens, (int64_t)hidden_size}, DType::F32);
             Tensor img_v_view = Tensor::wrap_gpu(all_v.f32() + txt_tokens * hidden_size, {img_tokens, (int64_t)hidden_size}, DType::F32);
 
-            // Image QKV
+            // Image QKV (M = img_tokens, doubled for cfg_batch=2)
             Tensor img_mod_bf16 = Tensor::alloc({img_tokens, (int64_t)hidden_size}, DType::BF16, true);
             modulate_to_bf16_cuda(img.f32(), img_shift1, img_scale1, img_mod_bf16.bf16(),
                                   img_tokens, hidden_size, 1e-6f);
@@ -772,7 +830,7 @@ struct ChromaRadiance {
             qk_norm(img_q_view.f32(), w.img_q_norm.f32(), img_tokens, num_heads, d_head);
             qk_norm(img_k_view.f32(), w.img_k_norm.f32(), img_tokens, num_heads, d_head);
 
-            // Text QKV
+            // Text QKV (M = txt_tokens, doubled for cfg_batch=2)
             Tensor txt_mod_bf16 = Tensor::alloc({txt_tokens, (int64_t)hidden_size}, DType::BF16, true);
             modulate_to_bf16_cuda(txt.f32(), txt_shift1, txt_scale1, txt_mod_bf16.bf16(),
                                   txt_tokens, hidden_size, 1e-6f);
@@ -783,11 +841,40 @@ struct ChromaRadiance {
             qk_norm(txt_q_view.f32(), w.txt_q_norm.f32(), txt_tokens, num_heads, d_head);
             qk_norm(txt_k_view.f32(), w.txt_k_norm.f32(), txt_tokens, num_heads, d_head);
 
-            Tensor q_r = all_q.reshape({total_tokens, (int64_t)num_heads, (int64_t)d_head});
-            Tensor k_r = all_k.reshape({total_tokens, (int64_t)num_heads, (int64_t)d_head});
-            Tensor v_r = all_v.reshape({total_tokens, (int64_t)num_heads, (int64_t)d_head});
+            if (cfg_batch == 1) {
+                // Direct attention (no rearrangement needed)
+                Tensor q_r = all_q.reshape({total_tokens, (int64_t)num_heads, (int64_t)d_head});
+                Tensor k_r = all_k.reshape({total_tokens, (int64_t)num_heads, (int64_t)d_head});
+                Tensor v_r = all_v.reshape({total_tokens, (int64_t)num_heads, (int64_t)d_head});
+                attn = attention_with_rope(q_r, k_r, v_r, pe, num_heads, d_head, attn_mask);
+            } else {
+                // Gather per-batch Q/K/V from [txt_all | img_all] → [txt_b, img_b], run attention, scatter back
+                attn = Tensor::alloc({total_tokens, (int64_t)(num_heads * d_head)}, DType::F32, true);
+                size_t txt_bytes = txt_tokens_pb * hidden_size * sizeof(float);
+                size_t img_bytes = img_tokens_pb * hidden_size * sizeof(float);
+                for (int b = 0; b < cfg_batch; b++) {
+                    Tensor q_batch = Tensor::alloc({total_tokens_pb, (int64_t)hidden_size}, DType::F32, true);
+                    Tensor k_batch = Tensor::alloc({total_tokens_pb, (int64_t)hidden_size}, DType::F32, true);
+                    Tensor v_batch = Tensor::alloc({total_tokens_pb, (int64_t)hidden_size}, DType::F32, true);
+                    // Gather txt then img for this batch
+                    CHECK_CUDA(cudaMemcpyAsync(q_batch.f32(), all_q.f32() + b * txt_tokens_pb * hidden_size, txt_bytes, cudaMemcpyDeviceToDevice));
+                    CHECK_CUDA(cudaMemcpyAsync(q_batch.f32() + txt_tokens_pb * hidden_size, all_q.f32() + (txt_tokens + b * img_tokens_pb) * hidden_size, img_bytes, cudaMemcpyDeviceToDevice));
+                    CHECK_CUDA(cudaMemcpyAsync(k_batch.f32(), all_k.f32() + b * txt_tokens_pb * hidden_size, txt_bytes, cudaMemcpyDeviceToDevice));
+                    CHECK_CUDA(cudaMemcpyAsync(k_batch.f32() + txt_tokens_pb * hidden_size, all_k.f32() + (txt_tokens + b * img_tokens_pb) * hidden_size, img_bytes, cudaMemcpyDeviceToDevice));
+                    CHECK_CUDA(cudaMemcpyAsync(v_batch.f32(), all_v.f32() + b * txt_tokens_pb * hidden_size, txt_bytes, cudaMemcpyDeviceToDevice));
+                    CHECK_CUDA(cudaMemcpyAsync(v_batch.f32() + txt_tokens_pb * hidden_size, all_v.f32() + (txt_tokens + b * img_tokens_pb) * hidden_size, img_bytes, cudaMemcpyDeviceToDevice));
 
-            attn = attention_with_rope(q_r, k_r, v_r, pe, num_heads, d_head, attn_mask);
+                    Tensor q_r = q_batch.reshape({total_tokens_pb, (int64_t)num_heads, (int64_t)d_head});
+                    Tensor k_r = k_batch.reshape({total_tokens_pb, (int64_t)num_heads, (int64_t)d_head});
+                    Tensor v_r = v_batch.reshape({total_tokens_pb, (int64_t)num_heads, (int64_t)d_head});
+                    const float* batch_mask = attn_mask ? attn_mask + b * total_tokens_pb : nullptr;
+                    Tensor attn_batch = attention_with_rope(q_r, k_r, v_r, pe, num_heads, d_head, batch_mask);
+
+                    // Scatter back to [txt_all | img_all] layout
+                    CHECK_CUDA(cudaMemcpyAsync(attn.f32() + b * txt_tokens_pb * hidden_size, attn_batch.f32(), txt_bytes, cudaMemcpyDeviceToDevice));
+                    CHECK_CUDA(cudaMemcpyAsync(attn.f32() + (txt_tokens + b * img_tokens_pb) * hidden_size, attn_batch.f32() + txt_tokens_pb * hidden_size, img_bytes, cudaMemcpyDeviceToDevice));
+                }
+            }
         }
 
         if (!fused_attn_proj) {
@@ -882,10 +969,12 @@ struct ChromaRadiance {
     // ======================================================================
     void single_block_forward(int block_idx, Tensor& x,
                                const Tensor& mod, const Tensor& pe,
-                               const float* attn_mask = nullptr) {
+                               const float* attn_mask = nullptr,
+                               int cfg_batch = 1) {
         const auto& w = single_block_weights[block_idx];
 
         int64_t L = x.shape[0];
+        int64_t L_pb = L / cfg_batch;
 
         // Modulation: offset = 3*idx
         int off = 3 * block_idx;
@@ -939,58 +1028,78 @@ struct ChromaRadiance {
 
         if (use_fused_attn) {
             // Per-channel INT8: fused GEMM → dequant+qknorm+rope+permute → BF16
+            // With cfg_batch>1: Q/K/V are [cfg_batch*num_heads, L_pb, d_head]
             QuantizedAct qa = quantize_act_modulate(x.f32(), shift, scale,
                 1e-6f, L, hidden_size, sq_w.quant_smooth,
                 sq_w.quant_zero_points != nullptr);
             bool need_rowsum = (sq_w.quant_zero_points != nullptr);
             int32_t* i32_scratch = ensure_gemm_i32_scratch(L * hidden_size);
 
-            // BF16 Q/K/V in [n_head, L, d_head] layout
-            Tensor Q_bf16 = Tensor::alloc({(int64_t)num_heads, L, (int64_t)d_head}, DType::BF16, true);
-            Tensor K_bf16 = Tensor::alloc({(int64_t)num_heads, L, (int64_t)d_head}, DType::BF16, true);
-            Tensor V_bf16 = Tensor::alloc({(int64_t)num_heads, L, (int64_t)d_head}, DType::BF16, true);
+            Tensor Q_bf16 = Tensor::alloc({(int64_t)(cfg_batch * num_heads), L_pb, (int64_t)d_head}, DType::BF16, true);
+            Tensor K_bf16 = Tensor::alloc({(int64_t)(cfg_batch * num_heads), L_pb, (int64_t)d_head}, DType::BF16, true);
+            Tensor V_bf16 = Tensor::alloc({(int64_t)(cfg_batch * num_heads), L_pb, (int64_t)d_head}, DType::BF16, true);
 
-            // Q: GEMM → fused dequant+qknorm+rope → BF16
+            // Q: batched GEMM → per-batch fused dequant+qknorm+rope → BF16
             linear_int8_gemm(L, hidden_size, hidden_size, qa.x_int8, sq_w.i8(), i32_scratch);
-            int8_dequant_qknorm_rope_bf16_cuda(i32_scratch, qa.x_scale,
-                sq_w.quant_scales, (int)sq_w.quant_scales_dtype,
-                need_rowsum ? (const int8_t*)sq_w.quant_zero_points : nullptr,
-                need_rowsum ? qa.x_rowsum : nullptr,
-                sq_b.f32(), w.q_norm.f32(), pe.f32(), Q_bf16.bf16(),
-                (int)L, hidden_size, num_heads, d_head,
-                (int)L, 0, 0);
+            for (int b = 0; b < cfg_batch; b++) {
+                int8_dequant_qknorm_rope_bf16_cuda(
+                    i32_scratch + b * L_pb * hidden_size,
+                    qa.x_scale + b * L_pb,
+                    sq_w.quant_scales, (int)sq_w.quant_scales_dtype,
+                    need_rowsum ? (const int8_t*)sq_w.quant_zero_points : nullptr,
+                    need_rowsum ? qa.x_rowsum + b * L_pb : nullptr,
+                    sq_b.f32(), w.q_norm.f32(), pe.f32(),
+                    Q_bf16.bf16() + (int64_t)b * num_heads * L_pb * d_head,
+                    (int)L_pb, hidden_size, num_heads, d_head,
+                    (int)L_pb, 0, 0);
+            }
 
-            // K: GEMM → fused dequant+qknorm+rope → BF16
+            // K
             linear_int8_gemm(L, hidden_size, hidden_size, qa.x_int8, sk_w.i8(), i32_scratch);
-            int8_dequant_qknorm_rope_bf16_cuda(i32_scratch, qa.x_scale,
-                sk_w.quant_scales, (int)sk_w.quant_scales_dtype,
-                need_rowsum ? (const int8_t*)sk_w.quant_zero_points : nullptr,
-                need_rowsum ? qa.x_rowsum : nullptr,
-                sk_b.f32(), w.k_norm.f32(), pe.f32(), K_bf16.bf16(),
-                (int)L, hidden_size, num_heads, d_head,
-                (int)L, 0, 0);
+            for (int b = 0; b < cfg_batch; b++) {
+                int8_dequant_qknorm_rope_bf16_cuda(
+                    i32_scratch + b * L_pb * hidden_size,
+                    qa.x_scale + b * L_pb,
+                    sk_w.quant_scales, (int)sk_w.quant_scales_dtype,
+                    need_rowsum ? (const int8_t*)sk_w.quant_zero_points : nullptr,
+                    need_rowsum ? qa.x_rowsum + b * L_pb : nullptr,
+                    sk_b.f32(), w.k_norm.f32(), pe.f32(),
+                    K_bf16.bf16() + (int64_t)b * num_heads * L_pb * d_head,
+                    (int)L_pb, hidden_size, num_heads, d_head,
+                    (int)L_pb, 0, 0);
+            }
 
             // V: GEMM → fused dequant+permute → BF16 (no norm/RoPE)
             linear_int8_gemm(L, hidden_size, hidden_size, qa.x_int8, sv_w.i8(), i32_scratch);
-            int8_dequant_permute_bf16_cuda(i32_scratch, qa.x_scale,
-                sv_w.quant_scales, (int)sv_w.quant_scales_dtype,
-                need_rowsum ? (const int8_t*)sv_w.quant_zero_points : nullptr,
-                need_rowsum ? qa.x_rowsum : nullptr,
-                sv_b.f32(), V_bf16.bf16(),
-                (int)L, hidden_size, num_heads, d_head,
-                (int)L, 0);
+            for (int b = 0; b < cfg_batch; b++) {
+                int8_dequant_permute_bf16_cuda(
+                    i32_scratch + b * L_pb * hidden_size,
+                    qa.x_scale + b * L_pb,
+                    sv_w.quant_scales, (int)sv_w.quant_scales_dtype,
+                    need_rowsum ? (const int8_t*)sv_w.quant_zero_points : nullptr,
+                    need_rowsum ? qa.x_rowsum + b * L_pb : nullptr,
+                    sv_b.f32(),
+                    V_bf16.bf16() + (int64_t)b * num_heads * L_pb * d_head,
+                    (int)L_pb, hidden_size, num_heads, d_head,
+                    (int)L_pb, 0);
+            }
 
             // MLP: unchanged — uses linear_prequant_gelu writing to mlp_t F32
             linear_prequant_gelu(qa, sm_w, &sm_b, mlp_t);
 
-            // cuDNN SDPA
-            Tensor O_bf16 = Tensor::alloc({(int64_t)num_heads, L, (int64_t)d_head}, DType::BF16, true);
+            // cuDNN SDPA with batch=cfg_batch
+            Tensor O_bf16 = Tensor::alloc({(int64_t)(cfg_batch * num_heads), L_pb, (int64_t)d_head}, DType::BF16, true);
             cudnn_sdpa_forward(Q_bf16.bf16(), K_bf16.bf16(), V_bf16.bf16(),
-                               attn_mask, O_bf16.bf16(), num_heads, (int)L, d_head);
+                               attn_mask, O_bf16.bf16(), num_heads, (int)L_pb, d_head, cfg_batch);
             attn_out = Tensor::alloc({L, (int64_t)(num_heads * d_head)}, DType::F32, true);
-            unpermute_bf16_to_f32_cuda(O_bf16.bf16(), attn_out.f32(), num_heads, (int)L, d_head);
+            for (int b = 0; b < cfg_batch; b++) {
+                unpermute_bf16_to_f32_cuda(
+                    O_bf16.bf16() + (int64_t)b * num_heads * L_pb * d_head,
+                    attn_out.f32() + b * L_pb * hidden_size,
+                    num_heads, (int)L_pb, d_head);
+            }
         } else {
-            // Per-group INT8 or BF16: use F32 Q/K/V + separate qk_norm + attention_with_rope
+            // Per-group INT8 or BF16: GEMMs use full doubled L; attention runs per-batch
             Tensor q_t = Tensor::alloc({L, (int64_t)hidden_size}, DType::F32, true);
             Tensor k_t = Tensor::alloc({L, (int64_t)hidden_size}, DType::F32, true);
             Tensor v_t = Tensor::alloc({L, (int64_t)hidden_size}, DType::F32, true);
@@ -1006,11 +1115,25 @@ struct ChromaRadiance {
             qk_norm(q_t.f32(), w.q_norm.f32(), L, num_heads, d_head);
             qk_norm(k_t.f32(), w.k_norm.f32(), L, num_heads, d_head);
 
-            Tensor q_r = q_t.reshape({L, (int64_t)num_heads, (int64_t)d_head});
-            Tensor k_r = k_t.reshape({L, (int64_t)num_heads, (int64_t)d_head});
-            Tensor v_r = v_t.reshape({L, (int64_t)num_heads, (int64_t)d_head});
-
-            attn_out = attention_with_rope(q_r, k_r, v_r, pe, num_heads, d_head, attn_mask);
+            if (cfg_batch == 1) {
+                Tensor q_r = q_t.reshape({L, (int64_t)num_heads, (int64_t)d_head});
+                Tensor k_r = k_t.reshape({L, (int64_t)num_heads, (int64_t)d_head});
+                Tensor v_r = v_t.reshape({L, (int64_t)num_heads, (int64_t)d_head});
+                attn_out = attention_with_rope(q_r, k_r, v_r, pe, num_heads, d_head, attn_mask);
+            } else {
+                // x layout is [batch0_all | batch1_all], each batch contiguous
+                attn_out = Tensor::alloc({L, (int64_t)(num_heads * d_head)}, DType::F32, true);
+                for (int b = 0; b < cfg_batch; b++) {
+                    Tensor q_r = Tensor::wrap_gpu(q_t.f32() + b * L_pb * hidden_size, {L_pb, (int64_t)num_heads, (int64_t)d_head}, DType::F32);
+                    Tensor k_r = Tensor::wrap_gpu(k_t.f32() + b * L_pb * hidden_size, {L_pb, (int64_t)num_heads, (int64_t)d_head}, DType::F32);
+                    Tensor v_r = Tensor::wrap_gpu(v_t.f32() + b * L_pb * hidden_size, {L_pb, (int64_t)num_heads, (int64_t)d_head}, DType::F32);
+                    const float* batch_mask = attn_mask ? attn_mask + b * L_pb : nullptr;
+                    Tensor attn_batch = attention_with_rope(q_r, k_r, v_r, pe, num_heads, d_head, batch_mask);
+                    CHECK_CUDA(cudaMemcpyAsync(
+                        attn_out.f32() + b * L_pb * hidden_size,
+                        attn_batch.f32(), L_pb * hidden_size * sizeof(float), cudaMemcpyDeviceToDevice));
+                }
+            }
         }
 
         // Concat attn + MLP, then linear2 + gated residual
@@ -1367,6 +1490,97 @@ struct ChromaRadiance {
         }
 
         return output;
+    }
+
+    // ======================================================================
+    // Batched CFG forward pass — single pass with doubled token counts
+    // Each weight matrix loaded once from DRAM instead of twice
+    // ======================================================================
+    Tensor forward_cfg(const Tensor& x,
+                       const Tensor& context_cond, const Tensor& context_uncond,
+                       float timestep, const Tensor& pe, const Tensor& dct_features,
+                       const float* attn_mask_cond, const float* attn_mask_uncond,
+                       float cfg_scale) {
+        int H = x.shape[2], W = x.shape[3];
+        int64_t txt_tokens = context_cond.shape[0];
+        int64_t img_tokens = (int64_t)(H / patch_size) * (W / patch_size);
+        int64_t total_tokens = txt_tokens + img_tokens;
+
+        fwd_call_count++;
+
+        // 1. Image tokenization: once (shared between cond and uncond)
+        Tensor img_base = conv2d_img_in(x, H, W);
+
+        // 2. Stack img: [img_cond; img_uncond]
+        Tensor img = Tensor::alloc({2 * img_tokens, (int64_t)hidden_size}, DType::F32, true);
+        CHECK_CUDA(cudaMemcpyAsync(img.f32(), img_base.f32(),
+            img_tokens * hidden_size * sizeof(float), cudaMemcpyDeviceToDevice));
+        CHECK_CUDA(cudaMemcpyAsync(img.f32() + img_tokens * hidden_size, img_base.f32(),
+            img_tokens * hidden_size * sizeof(float), cudaMemcpyDeviceToDevice));
+
+        // 3. Stack txt: [txt_cond; txt_uncond] via separate projections
+        Tensor txt = Tensor::alloc({2 * txt_tokens, (int64_t)hidden_size}, DType::F32, true);
+        Tensor txt_cond_view = Tensor::wrap_gpu(txt.f32(), {txt_tokens, (int64_t)hidden_size}, DType::F32);
+        Tensor txt_uncond_view = Tensor::wrap_gpu(txt.f32() + txt_tokens * hidden_size,
+                                                   {txt_tokens, (int64_t)hidden_size}, DType::F32);
+        linear(context_cond, txt_in_w, &txt_in_b, txt_cond_view);
+        linear(context_uncond, txt_in_w, &txt_in_b, txt_uncond_view);
+
+        // 4. Compute modulation: once (depends only on timestep, same for both passes)
+        Tensor mod = compute_modulation(timestep, 0.0f);
+
+        // 5. Stack masks: [mask_cond, mask_uncond] for cuDNN SDPA batch=2
+        Tensor mask_stacked = Tensor::alloc({2 * total_tokens}, DType::F32, true);
+        CHECK_CUDA(cudaMemcpyAsync(mask_stacked.f32(), attn_mask_cond,
+            total_tokens * sizeof(float), cudaMemcpyDeviceToDevice));
+        CHECK_CUDA(cudaMemcpyAsync(mask_stacked.f32() + total_tokens, attn_mask_uncond,
+            total_tokens * sizeof(float), cudaMemcpyDeviceToDevice));
+
+        // 6. Double-stream blocks with cfg_batch=2
+        for (int i = 0; i < depth; i++) {
+            double_block_forward(i, img, txt, mod, pe, mask_stacked.f32(), 2);
+        }
+
+        // 7. Assemble combined tensor for single-stream blocks
+        // Layout: [batch0: txt_cond, img_cond | batch1: txt_uncond, img_uncond]
+        Tensor combined = Tensor::alloc({2 * total_tokens, (int64_t)hidden_size}, DType::F32, true);
+        // Batch 0: txt_cond then img_cond
+        CHECK_CUDA(cudaMemcpyAsync(combined.f32(),
+            txt.f32(), txt_tokens * hidden_size * sizeof(float), cudaMemcpyDeviceToDevice));
+        CHECK_CUDA(cudaMemcpyAsync(combined.f32() + txt_tokens * hidden_size,
+            img.f32(), img_tokens * hidden_size * sizeof(float), cudaMemcpyDeviceToDevice));
+        // Batch 1: txt_uncond then img_uncond
+        CHECK_CUDA(cudaMemcpyAsync(combined.f32() + total_tokens * hidden_size,
+            txt.f32() + txt_tokens * hidden_size,
+            txt_tokens * hidden_size * sizeof(float), cudaMemcpyDeviceToDevice));
+        CHECK_CUDA(cudaMemcpyAsync(combined.f32() + (total_tokens + txt_tokens) * hidden_size,
+            img.f32() + img_tokens * hidden_size,
+            img_tokens * hidden_size * sizeof(float), cudaMemcpyDeviceToDevice));
+
+        // 8. Single-stream blocks with cfg_batch=2
+        for (int i = 0; i < depth_single; i++) {
+            single_block_forward(i, combined, mod, pe, mask_stacked.f32(), 2);
+        }
+
+        // 9. Extract img_cond and img_uncond from combined
+        // Batch 0 img starts at offset txt_tokens within batch 0
+        // Batch 1 img starts at offset (total_tokens + txt_tokens) within batch 1
+        Tensor img_cond = Tensor::wrap_gpu(
+            combined.f32() + txt_tokens * hidden_size,
+            {img_tokens, (int64_t)hidden_size}, DType::F32);
+        Tensor img_uncond = Tensor::wrap_gpu(
+            combined.f32() + (total_tokens + txt_tokens) * hidden_size,
+            {img_tokens, (int64_t)hidden_size}, DType::F32);
+
+        // 10. NeRF decode separately (small, not worth batching)
+        Tensor velocity_cond = nerf_decode(img_cond, x, dct_features, H, W);
+        Tensor velocity_uncond = nerf_decode(img_uncond, x, dct_features, H, W);
+
+        // 11. CFG blend: out = uncond + cfg * (cond - uncond)
+        int64_t n = velocity_cond.numel();
+        cfg_blend_cuda(velocity_cond.f32(), velocity_uncond.f32(), velocity_cond.f32(), cfg_scale, n);
+
+        return velocity_cond;
     }
 };
 

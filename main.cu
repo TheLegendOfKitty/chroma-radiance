@@ -436,7 +436,8 @@ int main(int argc, char** argv) {
     }
 
     // Pre-build cuDNN SDPA graph (avoids 32ms one-time cost during first sampling step)
-    build_sdpa_graph(ChromaRadiance::num_heads, total_tokens, ChromaRadiance::d_head, true);
+    build_sdpa_graph(ChromaRadiance::num_heads, total_tokens, ChromaRadiance::d_head, true,
+                     use_cfg ? 2 : 1);
 
     // ========================================
     // Phase 4: Sampling
@@ -466,22 +467,16 @@ int main(int argc, char** argv) {
         auto step_start = std::chrono::high_resolution_clock::now();
 
         if (use_cfg) {
-            // Precompute shared work: image tokenization + modulation (same x and timestep)
-            Tensor img_base = chroma.conv2d_img_in(x, args.height, args.width);
-            Tensor mod = chroma.compute_modulation(sigma, 0.0f);
-
-            // Two-pass CFG: guided = uncond + cfg * (cond - uncond)
-            Tensor velocity_cond = chroma.forward(x, context, sigma, pe, dct_features, attn_mask.f32(), &img_base, &mod);
-            Tensor velocity_uncond = chroma.forward(x, context_uncond, sigma, pe, dct_features, attn_mask_uncond.f32(), &img_base, &mod);
-
-            // Fused CFG blend: 1 kernel instead of 3 (add_scaled + scale + add)
-            int64_t n = velocity_cond.numel();
-            cfg_blend_cuda(velocity_cond.f32(), velocity_uncond.f32(), velocity_cond.f32(), args.cfg_scale, n);
+            // Batched CFG: single forward pass with doubled token counts
+            Tensor velocity = chroma.forward_cfg(x, context, context_uncond, sigma, pe,
+                                                  dct_features, attn_mask.f32(), attn_mask_uncond.f32(),
+                                                  args.cfg_scale);
 
             // Diagnostic: print guided velocity stats for step 0
             if (args.debug && step == 0) {
+                int64_t n = velocity.numel();
                 std::vector<float> v(n);
-                CHECK_CUDA(cudaMemcpy(v.data(), velocity_cond.f32(), n * sizeof(float), cudaMemcpyDeviceToHost));
+                CHECK_CUDA(cudaMemcpy(v.data(), velocity.f32(), n * sizeof(float), cudaMemcpyDeviceToHost));
                 double sum = 0, abs_sum = 0;
                 for (int64_t i = 0; i < n; i++) { sum += v[i]; abs_sum += fabs(v[i]); }
                 printf("[DIAG] velocity (CFG): sum=%.6f, mean=%.6f, mean_abs=%.6f, first10=[%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f]\n",
@@ -491,7 +486,7 @@ int main(int argc, char** argv) {
                 if (f) { fwrite(v.data(), sizeof(float), n, f); fclose(f); printf("Dumped velocity to /tmp/velocity_f32.bin\n"); }
             }
 
-            sampler.step(x, velocity_cond, step);
+            sampler.step(x, velocity, step);
         } else {
             // Single conditioned pass
             Tensor velocity = chroma.forward(x, context, sigma, pe, dct_features, attn_mask.f32());

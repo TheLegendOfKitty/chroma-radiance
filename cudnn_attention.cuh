@@ -33,12 +33,14 @@ struct CudnnSdpaCache {
     int seq_len = 0;
     int d_head = 0;
     bool has_bias = false;
+    int batch = 0;
 
     void release() {
         graph.reset();
         if (workspace) { cudaFree(workspace); workspace = nullptr; }
         if (stats) { cudaFree(stats); stats = nullptr; }
         n_head = seq_len = d_head = 0;
+        batch = 0;
         has_stats = false;
     }
 };
@@ -283,7 +285,7 @@ static void init_cudnn() {
     if (!g_cudnn) CHECK_CUDNN(cudnnCreate(&g_cudnn));
 }
 
-static void build_sdpa_graph(int n_head, int L, int d_head, bool has_bias) {
+static void build_sdpa_graph(int n_head, int L, int d_head, bool has_bias, int batch_count = 1) {
     g_sdpa_cache.release();
 
     auto graph = std::make_shared<fe::graph::Graph>();
@@ -291,7 +293,7 @@ static void build_sdpa_graph(int n_head, int L, int d_head, bool has_bias) {
         .set_intermediate_data_type(fe::DataType_t::FLOAT)
         .set_compute_data_type(fe::DataType_t::FLOAT);
 
-    int64_t b = 1, h = n_head, s = L, d = d_head;
+    int64_t b = batch_count, h = n_head, s = L, d = d_head;
     float attn_scale = 1.0f / sqrtf((float)d_head);
 
     auto Q = graph->tensor(fe::graph::Tensor_attributes()
@@ -393,9 +395,10 @@ static void build_sdpa_graph(int n_head, int L, int d_head, bool has_bias) {
     g_sdpa_cache.seq_len = L;
     g_sdpa_cache.d_head = d_head;
     g_sdpa_cache.has_bias = has_bias;
+    g_sdpa_cache.batch = batch_count;
 
-    printf("cuDNN SDPA graph built: n_head=%d, L=%d, d_head=%d, bias=%d, stats=%d, workspace=%.1f KB\n",
-           n_head, L, d_head, has_bias, stats_generated, ws_size / 1024.0);
+    printf("cuDNN SDPA graph built: batch=%d, n_head=%d, L=%d, d_head=%d, bias=%d, stats=%d, workspace=%.1f KB\n",
+           batch_count, n_head, L, d_head, has_bias, stats_generated, ws_size / 1024.0);
 }
 
 // Execute cuDNN SDPA
@@ -405,17 +408,18 @@ static void build_sdpa_graph(int n_head, int L, int d_head, bool has_bias) {
 static void cudnn_sdpa_forward(
     const __nv_bfloat16* Q, const __nv_bfloat16* K, const __nv_bfloat16* V,
     const float* bias, __nv_bfloat16* O,
-    int n_head, int L, int d_head) {
+    int n_head, int L, int d_head, int batch = 1) {
 
     bool need_bias = (bias != nullptr);
 
-    // Rebuild graph if shape or bias presence changed
+    // Rebuild graph if shape, bias presence, or batch count changed
     if (!g_sdpa_cache.graph ||
         g_sdpa_cache.n_head != n_head ||
         g_sdpa_cache.seq_len != L ||
         g_sdpa_cache.d_head != d_head ||
-        g_sdpa_cache.has_bias != need_bias) {
-        build_sdpa_graph(n_head, L, d_head, need_bias);
+        g_sdpa_cache.has_bias != need_bias ||
+        g_sdpa_cache.batch != batch) {
+        build_sdpa_graph(n_head, L, d_head, need_bias, batch);
     }
 
     std::unordered_map<fe::graph::Tensor_attributes::uid_t, void*> variant_pack = {
