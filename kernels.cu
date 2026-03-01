@@ -403,6 +403,28 @@ void mul_cuda(const float* a, const float* b, float* out, int64_t n) {
     mul_kernel<<<blocks, threads>>>(a, b, out, n);
 }
 
+// Fused SiLU + elementwise multiply: out = silu(a) * b
+__global__ void silu_mul_kernel(const float* __restrict__ a, const float* __restrict__ b,
+                                 float* __restrict__ out, int64_t n) {
+    int64_t i = ((int64_t)blockIdx.x * blockDim.x + threadIdx.x) * 4;
+    if (i + 3 < n) {
+        float4 va = *reinterpret_cast<const float4*>(a + i);
+        float4 vb = *reinterpret_cast<const float4*>(b + i);
+        float4 r = {silu_val(va.x) * vb.x, silu_val(va.y) * vb.y,
+                    silu_val(va.z) * vb.z, silu_val(va.w) * vb.w};
+        *reinterpret_cast<float4*>(out + i) = r;
+    } else {
+        for (int64_t j = i; j < n && j < i + 4; j++) out[j] = silu_val(a[j]) * b[j];
+    }
+}
+
+void silu_mul_cuda(const float* a, const float* b, float* out, int64_t n) {
+    int threads = 256;
+    int64_t work = (n + 3) / 4;
+    int blocks = (work + threads - 1) / threads;
+    silu_mul_kernel<<<blocks, threads>>>(a, b, out, n);
+}
+
 __global__ void add_scaled_kernel(const float* x, const float* delta, float* out, float scale, int64_t n) {
     int64_t i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) out[i] = x[i] + delta[i] * scale;
@@ -784,6 +806,55 @@ void batched_transpose_2d_cuda(const float* input, float* output,
                 batch);
     batched_transpose_2d_kernel<<<blocks, threads>>>(input, output, batch, rows, cols);
 }
+
+// ============================================================================
+// Fused slice columns + batched transpose:
+// Reads column slice [col_offset, col_offset+slice_cols) from src [batch, total_cols],
+// interprets each batch's slice as [rows, cols] matrix (where rows*cols == slice_cols),
+// and writes the transpose [cols, rows] to output [batch, cols, rows].
+// Eliminates the intermediate buffer between slice_columns and batched_transpose.
+// ============================================================================
+__global__ void slice_transpose_kernel(const float* __restrict__ src, float* __restrict__ output,
+                                        int64_t batch, int64_t total_cols,
+                                        int64_t col_offset, int64_t rows, int64_t cols) {
+    __shared__ float tile[TILE_DIM][TILE_DIM + 1];
+
+    int64_t b = blockIdx.z;
+    if (b >= batch) return;
+    const float* in = src + b * total_cols + col_offset;  // start of this batch's column slice
+    float* out = output + b * rows * cols;
+
+    int bx = blockIdx.x * TILE_DIM;
+    int by = blockIdx.y * TILE_DIM;
+
+    // Load tile from contiguous sub-matrix [rows, cols] (slice is contiguous, stride = cols)
+    for (int j = 0; j < TILE_DIM; j += BLOCK_ROWS) {
+        int r = by + threadIdx.y + j;
+        int c = bx + threadIdx.x;
+        if (r < rows && c < cols)
+            tile[threadIdx.y + j][threadIdx.x] = in[r * cols + c];
+    }
+    __syncthreads();
+
+    // Write transposed: output [cols, rows]
+    for (int j = 0; j < TILE_DIM; j += BLOCK_ROWS) {
+        int r = bx + threadIdx.y + j;
+        int c = by + threadIdx.x;
+        if (r < cols && c < rows)
+            out[r * rows + c] = tile[threadIdx.x][threadIdx.y + j];
+    }
+}
+
+void slice_transpose_cuda(const float* src, float* output,
+                            int64_t batch, int64_t total_cols,
+                            int64_t col_offset, int64_t rows, int64_t cols) {
+    dim3 threads(TILE_DIM, BLOCK_ROWS);
+    dim3 blocks((cols + TILE_DIM - 1) / TILE_DIM,
+                (rows + TILE_DIM - 1) / TILE_DIM,
+                batch);
+    slice_transpose_kernel<<<blocks, threads>>>(src, output, batch, total_cols, col_offset, rows, cols);
+}
+
 #undef TILE_DIM
 #undef BLOCK_ROWS
 

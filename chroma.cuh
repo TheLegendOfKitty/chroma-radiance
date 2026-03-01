@@ -14,6 +14,7 @@ void rms_norm_cuda(const float* x, const float* scale, float* out, int64_t rows,
 void gelu_cuda(const float* x, float* out, int64_t n);
 void gelu_to_bf16_cuda(const float* x, __nv_bfloat16* out, int64_t n);
 void silu_cuda(const float* x, float* out, int64_t n);
+void silu_mul_cuda(const float* a, const float* b, float* out, int64_t n);
 void add_cuda(const float* a, const float* b, float* out, int64_t n);
 void mul_cuda(const float* a, const float* b, float* out, int64_t n);
 void modulate_cuda(const float* x, const float* shift, const float* scale,
@@ -55,6 +56,9 @@ void rms_norm_nchw_cuda(const float* input, const float* scale, float* output,
 void slice_columns_cuda(const float* src, float* dst,
                          int64_t L, int64_t total_cols,
                          int64_t col_offset, int64_t slice_cols);
+void slice_transpose_cuda(const float* src, float* output,
+                            int64_t batch, int64_t total_cols,
+                            int64_t col_offset, int64_t rows, int64_t cols);
 void modulate_quantize_int8_cuda(const float* x, const float* shift, const float* scale,
                                   const float* smooth,
                                   int8_t* X_int8, float* x_scale, float* x_rowsum,
@@ -590,6 +594,7 @@ struct ChromaRadiance {
 
         // Attention result: [total_tokens, hidden_size] F32
         Tensor attn;
+        bool fused_attn_proj = false;  // set true if unpermute+quantize+proj done inside the block
 
         bool use_fused_attn = (iq_w.dtype == DType::INT8
                                && iq_w.quant_group_size >= (int)iq_w.shape[1]
@@ -682,9 +687,67 @@ struct ChromaRadiance {
             cudnn_sdpa_forward(Q_bf16.bf16(), K_bf16.bf16(), V_bf16.bf16(),
                                attn_mask, O_bf16.bf16(), num_heads, (int)total_tokens, d_head);
 
-            // Unpermute [n_head, L, d_head] BF16 → [L, n_head*d_head] F32
-            attn = Tensor::alloc({total_tokens, (int64_t)(num_heads * d_head)}, DType::F32, true);
-            unpermute_bf16_to_f32_cuda(O_bf16.bf16(), attn.f32(), num_heads, (int)total_tokens, d_head);
+            // Check if projection weights support fused unpermute+quantize path
+            bool can_fuse_img_proj = (w.img_proj_w.dtype == DType::INT8
+                && w.img_proj_w.quant_group_size >= (int)w.img_proj_w.shape[1]
+                && w.img_proj_w.shape[1] % 4 == 0);
+            bool can_fuse_txt_proj = (w.txt_proj_w.dtype == DType::INT8
+                && w.txt_proj_w.quant_group_size >= (int)w.txt_proj_w.shape[1]
+                && w.txt_proj_w.shape[1] % 4 == 0);
+
+            if (can_fuse_img_proj && can_fuse_txt_proj) {
+                // Fused unpermute BF16 → INT8 quantize, called separately for txt and img
+                // Token layout in SDPA output [n_head, total_tokens, d_head]: [txt, img]
+                int8_t* attn_i8 = ensure_act_int8_scratch(total_tokens * hidden_size);
+                float* attn_sc = ensure_act_scale_scratch(total_tokens);
+                bool need_rowsum = (w.img_proj_w.quant_zero_points != nullptr);
+                float* attn_rs = need_rowsum ? ensure_act_rowsum_scratch(total_tokens) : nullptr;
+
+                // Text tokens: offset 0 in SDPA output, use txt_proj smooth
+                unpermute_bf16_quantize_int8_cuda(
+                    O_bf16.bf16(),
+                    attn_i8, attn_sc, need_rowsum ? attn_rs : nullptr,
+                    w.txt_proj_w.quant_smooth,
+                    num_heads, (int)total_tokens, d_head,
+                    (int)txt_tokens, 0,
+                    need_rowsum, g_hadamard_enabled);
+
+                // Image tokens: offset txt_tokens in SDPA output, use img_proj smooth
+                unpermute_bf16_quantize_int8_cuda(
+                    O_bf16.bf16(),
+                    attn_i8 + txt_tokens * hidden_size,
+                    attn_sc + txt_tokens,
+                    need_rowsum ? attn_rs + txt_tokens : nullptr,
+                    w.img_proj_w.quant_smooth,
+                    num_heads, (int)total_tokens, d_head,
+                    (int)img_tokens, (int)txt_tokens,
+                    need_rowsum, g_hadamard_enabled);
+
+                // Image projection: use pre-quantized INT8 slice
+                QuantizedAct qa_img_attn;
+                qa_img_attn.x_int8 = attn_i8 + txt_tokens * hidden_size;
+                qa_img_attn.x_scale = attn_sc + txt_tokens;
+                qa_img_attn.x_rowsum = need_rowsum ? attn_rs + txt_tokens : nullptr;
+                qa_img_attn.M = img_tokens;
+                qa_img_attn.K = hidden_size;
+                linear_prequant_gated_residual(qa_img_attn, w.img_proj_w, &w.img_proj_b,
+                                                img.f32(), img_gate1, img_tokens, hidden_size);
+
+                // Text projection: use pre-quantized INT8 slice
+                QuantizedAct qa_txt_attn;
+                qa_txt_attn.x_int8 = attn_i8;
+                qa_txt_attn.x_scale = attn_sc;
+                qa_txt_attn.x_rowsum = need_rowsum ? attn_rs : nullptr;
+                qa_txt_attn.M = txt_tokens;
+                qa_txt_attn.K = hidden_size;
+                linear_prequant_gated_residual(qa_txt_attn, w.txt_proj_w, &w.txt_proj_b,
+                                                txt.f32(), txt_gate1, txt_tokens, hidden_size);
+                fused_attn_proj = true;
+            } else {
+                // Fallback: unpermute to F32
+                attn = Tensor::alloc({total_tokens, (int64_t)(num_heads * d_head)}, DType::F32, true);
+                unpermute_bf16_to_f32_cuda(O_bf16.bf16(), attn.f32(), num_heads, (int)total_tokens, d_head);
+            }
         } else {
             // Per-group INT8 or BF16: use F32 Q/K/V + separate qk_norm + attention_with_rope
             Tensor all_q = Tensor::alloc({total_tokens, (int64_t)hidden_size}, DType::F32, true);
@@ -727,14 +790,21 @@ struct ChromaRadiance {
             attn = attention_with_rope(q_r, k_r, v_r, pe, num_heads, d_head, attn_mask);
         }
 
-        Tensor txt_attn = Tensor::wrap_gpu(attn.f32(),
-                                            {txt_tokens, (int64_t)hidden_size}, DType::F32);
-        Tensor img_attn = Tensor::wrap_gpu(attn.f32() + txt_tokens * hidden_size,
-                                            {img_tokens, (int64_t)hidden_size}, DType::F32);
+        if (!fused_attn_proj) {
+            // Fallback path: F32 attention output → quantize → proj → gated_residual
+            Tensor txt_attn = Tensor::wrap_gpu(attn.f32(),
+                                                {txt_tokens, (int64_t)hidden_size}, DType::F32);
+            Tensor img_attn = Tensor::wrap_gpu(attn.f32() + txt_tokens * hidden_size,
+                                                {img_tokens, (int64_t)hidden_size}, DType::F32);
 
-        // === Image: proj + gated residual ===
-        linear_gated_residual(img_attn, w.img_proj_w, &w.img_proj_b,
-                               img.f32(), img_gate1, img_tokens, hidden_size);
+            // === Image: proj + gated residual ===
+            linear_gated_residual(img_attn, w.img_proj_w, &w.img_proj_b,
+                                   img.f32(), img_gate1, img_tokens, hidden_size);
+
+            // === Text: proj + gated residual ===
+            linear_gated_residual(txt_attn, w.txt_proj_w, &w.txt_proj_b,
+                                   txt.f32(), txt_gate1, txt_tokens, hidden_size);
+        }
 
         // Image MLP sublayer
         int64_t K_mlp = w.img_mlp_0_w.shape[1];
@@ -770,10 +840,6 @@ struct ChromaRadiance {
             gated_residual_cuda(img.f32(), img_mlp_out.f32(), img_gate2,
                                 img.f32(), img_tokens, hidden_size);
         }
-
-        // === Text: proj + gated residual ===
-        linear_gated_residual(txt_attn, w.txt_proj_w, &w.txt_proj_b,
-                               txt.f32(), txt_gate1, txt_tokens, hidden_size);
 
         // Text MLP sublayer
         int64_t K_mlp_txt = w.txt_mlp_0_w.shape[1];
@@ -1072,30 +1138,18 @@ struct ChromaRadiance {
         // param_generator: [batch, 3 * 64 * 256] from s [batch, 3072]
         Tensor params = linear_forward(s, w.param_gen_w, &w.param_gen_b);
 
-        // Split into 3 matrices, each [batch, hid*mlp_dim = 64*256 = 16384]
-        // params is [batch, 3*chunk] row-major; split along columns
+        // Fused slice+transpose: read column slice from params, write transposed directly
+        // fc1_gate, fc1_value: [hid, mlp_dim] per batch → transpose to [mlp_dim, hid]
+        // fc2: [mlp_dim, hid] per batch → transpose to [hid, mlp_dim]
         int64_t chunk = hid * mlp_dim;
         int64_t total_param_cols = 3 * chunk;
-        Tensor fc1_gate_t = Tensor::alloc({batch, chunk}, DType::F32, true);
-        Tensor fc1_value_t = Tensor::alloc({batch, chunk}, DType::F32, true);
-        Tensor fc2_t = Tensor::alloc({batch, chunk}, DType::F32, true);
-        slice_columns_cuda(params.f32(), fc1_gate_t.f32(), batch, total_param_cols, 0, chunk);
-        slice_columns_cuda(params.f32(), fc1_value_t.f32(), batch, total_param_cols, chunk, chunk);
-        slice_columns_cuda(params.f32(), fc2_t.f32(), batch, total_param_cols, 2 * chunk, chunk);
-
-        // fc1_gate, fc1_value: flat data in C order is [hid, mlp_dim] per batch
-        //   → transpose to [mlp_dim, hid] per batch (ggml permute)
-        //   → L2 norm on last dim (hid)
-        // fc2: flat data in C order is [mlp_dim, hid] per batch
-        //   → transpose to [hid, mlp_dim] per batch (ggml permute)
-        //   → L2 norm on last dim (mlp_dim)
         Tensor w_gate = Tensor::alloc({batch, mlp_dim, hid}, DType::F32, true);
         Tensor w_value = Tensor::alloc({batch, mlp_dim, hid}, DType::F32, true);
         Tensor w_fc2 = Tensor::alloc({batch, hid, mlp_dim}, DType::F32, true);
 
-        batched_transpose_2d_cuda(fc1_gate_t.f32(), w_gate.f32(), batch, hid, mlp_dim);
-        batched_transpose_2d_cuda(fc1_value_t.f32(), w_value.f32(), batch, hid, mlp_dim);
-        batched_transpose_2d_cuda(fc2_t.f32(), w_fc2.f32(), batch, mlp_dim, hid);
+        slice_transpose_cuda(params.f32(), w_gate.f32(), batch, total_param_cols, 0, hid, mlp_dim);
+        slice_transpose_cuda(params.f32(), w_value.f32(), batch, total_param_cols, chunk, hid, mlp_dim);
+        slice_transpose_cuda(params.f32(), w_fc2.f32(), batch, total_param_cols, 2 * chunk, mlp_dim, hid);
 
         // L2 normalize along last dim
         l2_norm_cuda(w_gate.f32(), w_gate.f32(), batch * mlp_dim, hid, 1e-12f);
@@ -1110,23 +1164,17 @@ struct ChromaRadiance {
         Tensor x_normed = Tensor::alloc({batch, seq, hid}, DType::F32, true);
         rms_norm_cuda(x.f32(), w.norm_scale.f32(), x_normed.f32(), batch * seq, hid, 1e-6f);
 
-        // Batched matmul with B transposed — eliminates 3 transpose operations
-        // w_gate [batch, mlp_dim, hid]: x_normed @ w_gate^T = [batch, seq, hid] @ [batch, hid, mlp_dim]
-        // w_value [batch, mlp_dim, hid]: same
+        // Batched matmul with B transposed
         Tensor x1 = Tensor::alloc({batch, seq, mlp_dim}, DType::F32, true);
         Tensor x2 = Tensor::alloc({batch, seq, mlp_dim}, DType::F32, true);
 
         batched_matmul_Bt(x_normed, w_gate, x1);
         batched_matmul_Bt(x_normed, w_value, x2);
 
-        // SiLU on x1
-        silu_cuda(x1.f32(), x1.f32(), batch * seq * mlp_dim);
+        // Fused SiLU + mul: x1 = silu(x1) * x2
+        silu_mul_cuda(x1.f32(), x2.f32(), x1.f32(), batch * seq * mlp_dim);
 
-        // x = x1 * x2
-        mul_cuda(x1.f32(), x2.f32(), x1.f32(), batch * seq * mlp_dim);
-
-        // x = x1 @ w_fc2^T = [batch, seq, mlp_dim] @ [batch, mlp_dim, hid]
-        // w_fc2 [batch, hid, mlp_dim]: x1 @ w_fc2^T = [batch, seq, mlp_dim] @ [batch, mlp_dim, hid]
+        // x = x1 @ w_fc2^T
         Tensor x_out = Tensor::alloc({batch, seq, hid}, DType::F32, true);
         batched_matmul_Bt(x1, w_fc2, x_out);
 

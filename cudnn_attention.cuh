@@ -74,6 +74,211 @@ static void unpermute_bf16_to_f32_cuda(const __nv_bfloat16* src, float* dst,
     unpermute_bf16_to_f32_kernel<<<blocks, threads>>>(src, dst, n_head, L, d_head);
 }
 
+// ============================================================================
+// Fused unpermute BF16 [n_head, L, d_head] → INT8 quantized [L, n_head*d_head]
+// Combines unpermute + optional smooth + Hadamard + absmax + quantize in one kernel.
+// Each block handles one row (token) of the output [L, hidden_size].
+// ============================================================================
+extern bool g_hadamard_enabled;
+
+// Device helper: block-diagonal Walsh-Hadamard Transform in smem
+__device__ void wht_inplace_smem_attn(float* smem, int dim, int block_size, int num_blocks) {
+    float norm = rsqrtf((float)block_size);
+    int n_stages = __ffs(block_size) - 1;
+    int pairs_per_block = block_size >> 1;
+    int total_pairs = num_blocks * pairs_per_block;
+
+    for (int stage = 0; stage < n_stages; stage++) {
+        int half = 1 << stage;
+        int span = half << 1;
+        for (int idx = threadIdx.x; idx < total_pairs; idx += blockDim.x) {
+            int block = idx / pairs_per_block;
+            int pair = idx % pairs_per_block;
+            int base = block * block_size;
+            int i = base + (pair / half) * span + (pair % half);
+            int j = i + half;
+            float a = smem[i], b = smem[j];
+            smem[i] = a + b;
+            smem[j] = a - b;
+        }
+        __syncthreads();
+    }
+    // Normalize
+    for (int i = threadIdx.x; i < dim; i += blockDim.x)
+        smem[i] *= norm;
+    __syncthreads();
+}
+
+template<bool NEED_ROWSUM, bool HADAMARD>
+__global__ void unpermute_bf16_quantize_int8_kernel(
+    const __nv_bfloat16* __restrict__ src,  // [n_head, L_stride, d_head]
+    int8_t* __restrict__ X_int8,            // [num_tokens, hidden_size]
+    float* __restrict__ x_scale,            // [num_tokens]
+    float* __restrict__ x_rowsum,           // [num_tokens] or nullptr
+    const float* __restrict__ smooth,       // [hidden_size] or nullptr
+    int n_head, int L_stride, int d_head,
+    int num_tokens, int token_offset)
+{
+    int token = blockIdx.x;
+    if (token >= num_tokens) return;
+
+    int hidden_size = n_head * d_head;
+    int8_t* out_row = X_int8 + (int64_t)token * hidden_size;
+    int src_token = token + token_offset;  // offset into BF16 [n_head, L_stride, d_head]
+
+    extern __shared__ char uq_smem[];
+
+    if constexpr (HADAMARD) {
+        // Hadamard path: gather → smooth → cache in smem → WHT → absmax → quantize
+        float* cached = reinterpret_cast<float*>(uq_smem);
+        float* sdata = cached + hidden_size;
+
+        // Gather from BF16 [n_head, L_stride, d_head] → F32 [hidden_size] with unpermute
+        for (int k = threadIdx.x; k < hidden_size; k += blockDim.x) {
+            int h = k / d_head;
+            int d = k % d_head;
+            int64_t src_idx = (int64_t)h * L_stride * d_head + (int64_t)src_token * d_head + d;
+            float val = __bfloat162float(src[src_idx]);
+            if (smooth) val /= smooth[k];
+            cached[k] = val;
+        }
+        __syncthreads();
+
+        // Apply WHT in-place in smem
+        int block_size = hidden_size & (-hidden_size);
+        int num_blocks_wht = hidden_size / block_size;
+        wht_inplace_smem_attn(cached, hidden_size, block_size, num_blocks_wht);
+
+        // Find absmax
+        float local_max = 0.0f;
+        for (int k = threadIdx.x; k < hidden_size; k += blockDim.x)
+            local_max = fmaxf(local_max, fabsf(cached[k]));
+        sdata[threadIdx.x] = local_max;
+        __syncthreads();
+        for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+            if (threadIdx.x < (unsigned)s)
+                sdata[threadIdx.x] = fmaxf(sdata[threadIdx.x], sdata[threadIdx.x + s]);
+            __syncthreads();
+        }
+        float absmax = sdata[0];
+        float inv_scale = (absmax > 1e-10f) ? 127.0f / absmax : 0.0f;
+        if (threadIdx.x == 0) x_scale[token] = absmax / 127.0f;
+        __syncthreads();
+
+        // Quantize from smem cache (packed INT8 writes)
+        int local_sum = 0;
+        int k4_limit = hidden_size & ~3;
+        for (int k = threadIdx.x * 4; k < k4_limit; k += blockDim.x * 4) {
+            int q0 = max(-128, min(127, __float2int_rn(cached[k]     * inv_scale)));
+            int q1 = max(-128, min(127, __float2int_rn(cached[k + 1] * inv_scale)));
+            int q2 = max(-128, min(127, __float2int_rn(cached[k + 2] * inv_scale)));
+            int q3 = max(-128, min(127, __float2int_rn(cached[k + 3] * inv_scale)));
+            *reinterpret_cast<int32_t*>(out_row + k) =
+                (q0 & 0xFF) | ((q1 & 0xFF) << 8) | ((q2 & 0xFF) << 16) | ((q3 & 0xFF) << 24);
+            if constexpr (NEED_ROWSUM) local_sum += q0 + q1 + q2 + q3;
+        }
+
+        if constexpr (NEED_ROWSUM) {
+            int* idata = reinterpret_cast<int*>(sdata);
+            idata[threadIdx.x] = local_sum;
+            __syncthreads();
+            for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+                if (threadIdx.x < (unsigned)s)
+                    idata[threadIdx.x] += idata[threadIdx.x + s];
+                __syncthreads();
+            }
+            if (threadIdx.x == 0) x_rowsum[token] = (float)idata[0];
+        }
+    } else {
+        // Non-Hadamard: 2-pass (absmax, quantize) with gather from BF16
+        float* sdata = reinterpret_cast<float*>(uq_smem);
+
+        // Pass 1: gather from BF16 + find absmax
+        float local_max = 0.0f;
+        int k4_limit = hidden_size & ~3;
+        for (int k = threadIdx.x; k < hidden_size; k += blockDim.x) {
+            int h = k / d_head;
+            int d = k % d_head;
+            int64_t src_idx = (int64_t)h * L_stride * d_head + (int64_t)src_token * d_head + d;
+            float val = __bfloat162float(src[src_idx]);
+            if (smooth) val /= smooth[k];
+            local_max = fmaxf(local_max, fabsf(val));
+        }
+        sdata[threadIdx.x] = local_max;
+        __syncthreads();
+        for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+            if (threadIdx.x < (unsigned)s)
+                sdata[threadIdx.x] = fmaxf(sdata[threadIdx.x], sdata[threadIdx.x + s]);
+            __syncthreads();
+        }
+        float absmax = sdata[0];
+        float inv_scale = (absmax > 1e-10f) ? 127.0f / absmax : 0.0f;
+        if (threadIdx.x == 0) x_scale[token] = absmax / 127.0f;
+        __syncthreads();
+
+        // Pass 2: gather from BF16 + quantize
+        int local_sum = 0;
+        for (int k = threadIdx.x * 4; k < k4_limit; k += blockDim.x * 4) {
+            int q[4];
+            for (int j = 0; j < 4; j++) {
+                int kj = k + j;
+                int h = kj / d_head;
+                int d = kj % d_head;
+                int64_t src_idx = (int64_t)h * L_stride * d_head + (int64_t)src_token * d_head + d;
+                float val = __bfloat162float(src[src_idx]);
+                if (smooth) val /= smooth[kj];
+                q[j] = max(-128, min(127, __float2int_rn(val * inv_scale)));
+                if constexpr (NEED_ROWSUM) local_sum += q[j];
+            }
+            *reinterpret_cast<int32_t*>(out_row + k) =
+                (q[0] & 0xFF) | ((q[1] & 0xFF) << 8) | ((q[2] & 0xFF) << 16) | ((q[3] & 0xFF) << 24);
+        }
+
+        if constexpr (NEED_ROWSUM) {
+            int* idata = reinterpret_cast<int*>(sdata);
+            idata[threadIdx.x] = local_sum;
+            __syncthreads();
+            for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+                if (threadIdx.x < (unsigned)s)
+                    idata[threadIdx.x] += idata[threadIdx.x + s];
+                __syncthreads();
+            }
+            if (threadIdx.x == 0) x_rowsum[token] = (float)idata[0];
+        }
+    }
+}
+
+static void unpermute_bf16_quantize_int8_cuda(
+    const __nv_bfloat16* src,  // [n_head, L_stride, d_head]
+    int8_t* X_int8,            // [num_tokens, hidden_size]
+    float* x_scale,            // [num_tokens]
+    float* x_rowsum,           // [num_tokens] or nullptr
+    const float* smooth,       // [hidden_size] or nullptr
+    int n_head, int L_stride, int d_head,
+    int num_tokens, int token_offset,
+    bool need_rowsum, bool hadamard)
+{
+    int hidden_size = n_head * d_head;
+    int threads = 256;
+    if (hadamard) {
+        size_t smem_bytes = (hidden_size + threads) * sizeof(float);
+        if (need_rowsum)
+            unpermute_bf16_quantize_int8_kernel<true, true><<<num_tokens, threads, smem_bytes>>>(
+                src, X_int8, x_scale, x_rowsum, smooth, n_head, L_stride, d_head, num_tokens, token_offset);
+        else
+            unpermute_bf16_quantize_int8_kernel<false, true><<<num_tokens, threads, smem_bytes>>>(
+                src, X_int8, x_scale, x_rowsum, smooth, n_head, L_stride, d_head, num_tokens, token_offset);
+    } else {
+        size_t smem_bytes = threads * sizeof(float);
+        if (need_rowsum)
+            unpermute_bf16_quantize_int8_kernel<true, false><<<num_tokens, threads, smem_bytes>>>(
+                src, X_int8, x_scale, x_rowsum, smooth, n_head, L_stride, d_head, num_tokens, token_offset);
+        else
+            unpermute_bf16_quantize_int8_kernel<false, false><<<num_tokens, threads, smem_bytes>>>(
+                src, X_int8, x_scale, x_rowsum, smooth, n_head, L_stride, d_head, num_tokens, token_offset);
+    }
+}
+
 static void init_cudnn() {
     if (!g_cudnn) CHECK_CUDNN(cudnnCreate(&g_cudnn));
 }
